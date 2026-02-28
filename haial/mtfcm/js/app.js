@@ -1,0 +1,6104 @@
+/**
+ * MTFCM - Multi-Timeframe Confluence Monitor
+ * Main Application Logic v4.9.4 - Per-coin confluence + pattern side filtering
+ */
+
+const APP_VERSION = "4.9.5-haial";
+
+// ============================================
+// SECURITY UTILITIES
+// ============================================
+
+function sanitizeHtml(str) {
+    if (typeof str !== 'string') return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+function sanitizeInput(str) {
+    if (typeof str !== 'string') return '';
+    return str.replace(/[<>"'&]/g, '').trim();
+}
+
+function validateSymbol(sym) {
+    return typeof sym === 'string' && /^[A-Z0-9]{2,20}$/.test(sym);
+}
+
+function safeParse(str, fallback) {
+    try { return JSON.parse(str); } catch(e) { console.warn('JSON parse failed:', e.message); return fallback; }
+}
+
+// ============================================
+// STATE MANAGEMENT
+// ============================================
+
+// DEFAULT_SETTINGS is defined in coins.js (loaded first)
+
+const state = {
+    currentCoin: null,
+    coins: [],
+    coinData: {}, // Stores price/volume/change data for sorting
+    currentSort: 'default',
+    timeframes: [],
+    settings: { ...DEFAULT_SETTINGS },
+    data: {},
+    candles: {},
+    patterns: {}, // Detected patterns per TF
+    chartStates: {},
+    globalZoom: 1,
+    confluenceHistory: [], // Historical high confluence moments
+    lastRecordedPrice: null, // For tracking price movement after confluence
+    hintTimeout: null, // For keyboard hint display
+    intervals: {
+        price: null,
+        candles: null,
+        timer: null
+    },
+    ws: null,        // WebSocket connection
+    wsReconnect: 0   // Reconnect attempt count
+};
+
+// Number of candles to fetch per timeframe
+const CANDLE_LIMIT = 200;
+
+// ============================================
+// CANDLESTICK PATTERN DEFINITIONS
+// ============================================
+
+const PATTERNS = {
+    // Single candle patterns
+    doji: { name: 'Doji', emoji: '✚', type: 'neutral', spans: 1 },
+    hammer: { name: 'Hammer', emoji: '🔨', type: 'bullish', spans: 1 },
+    invertedHammer: { name: 'Inv Hammer', emoji: '⚒️', type: 'bullish', spans: 1 },
+    hangingMan: { name: 'Hanging Man', emoji: '🧍', type: 'bearish', spans: 1 },
+    shootingStar: { name: 'Shoot Star', emoji: '💫', type: 'bearish', spans: 1 },
+    marubozu: { name: 'Marubozu', emoji: '▮', type: 'neutral', spans: 1 },
+    spinningTop: { name: 'Spin Top', emoji: '🔄', type: 'neutral', spans: 1 },
+    
+    // Two candle patterns
+    bullishEngulfing: { name: 'Bull Engulf', emoji: '🟢⬆️', type: 'bullish', spans: 2 },
+    bearishEngulfing: { name: 'Bear Engulf', emoji: '🔴⬇️', type: 'bearish', spans: 2 },
+    bullishHarami: { name: 'Bull Harami', emoji: '🟢🤰', type: 'bullish', spans: 2 },
+    bearishHarami: { name: 'Bear Harami', emoji: '🔴🤰', type: 'bearish', spans: 2 },
+    piercingLine: { name: 'Piercing', emoji: '🗡️', type: 'bullish', spans: 2 },
+    darkCloudCover: { name: 'Dark Cloud', emoji: '☁️', type: 'bearish', spans: 2 },
+    tweezerTop: { name: 'Tweez Top', emoji: '🔝🔝', type: 'bearish', spans: 2 },
+    tweezerBottom: { name: 'Tweez Bot', emoji: '🔻🔻', type: 'bullish', spans: 2 },
+    
+    // Three candle patterns
+    morningStar: { name: 'Morning ⭐', emoji: '🌅', type: 'bullish', spans: 3 },
+    eveningStar: { name: 'Evening ⭐', emoji: '🌆', type: 'bearish', spans: 3 },
+    threeWhiteSoldiers: { name: '3 Soldiers', emoji: '💂💂💂', type: 'bullish', spans: 3 },
+    threeBlackCrows: { name: '3 Crows', emoji: '🐦‍⬛🐦‍⬛🐦‍⬛', type: 'bearish', spans: 3 }
+};
+
+// ============================================
+// INITIALIZATION
+// ============================================
+
+// ============================================
+// HAIAL BRIDGE INTEGRATION
+// ============================================
+
+const IS_HAIAL_BRIDGE = !!(document.getElementById('haial-filter-badge'));
+
+document.addEventListener('DOMContentLoaded', () => {
+    if (IS_HAIAL_BRIDGE) {
+        // Running inside Haial — wait for halal pairs to load
+        console.log('[MTFCM] Haial bridge detected, waiting for halal pairs...');
+        
+        function bootWithPairs(pairs) {
+            if (pairs && pairs.length > 0) {
+                applyHalalFilter(pairs);
+            }
+            try {
+                initApp();
+                // Show the app, hide loading spinner
+                document.body.classList.add('mtfcm-ready');
+            } catch(err) {
+                console.error('MTFCM init failed:', err);
+                const app = document.getElementById('mtfcm-app');
+                if (app) app.innerHTML = '<div style="padding:2rem;color:#f87171;font-family:monospace;"><h2 style="color:#818cf8;">⚠️ MTFCM Failed to Load</h2><p style="color:#b8b8d0;">Try clearing your browser cache and localStorage, then refresh.</p><p>Error: ' + (err.message||err) + '</p><button onclick="localStorage.clear();location.reload();" style="margin-top:1rem;padding:0.5rem 1rem;background:#818cf8;color:#fff;border:none;border-radius:8px;cursor:pointer;">🔄 Clear Cache & Reload</button></div>';
+            }
+        }
+        
+        // Check if bridge already loaded pairs (race condition guard)
+        if (window.HALAL_PAIRS && window.HALAL_PAIRS.length > 0) {
+            bootWithPairs(window.HALAL_PAIRS);
+        } else {
+            window.addEventListener('haial-pairs-loaded', (e) => {
+                bootWithPairs(e.detail.pairs || []);
+            });
+        }
+    } else {
+        // Standalone mode — init immediately
+        try {
+            initApp();
+        } catch(e) {
+            console.error('MTFCM init failed:', e);
+            document.body.innerHTML = '<div style="padding:2rem;color:#f87171;font-family:monospace;background:#0c0c1d;min-height:100vh;"><h2 style="color:#818cf8;">⚠️ MTFCM Failed to Load</h2><p style="color:#b8b8d0;">Try clearing your browser cache and localStorage, then refresh.</p><p>Error: ' + (e.message||e) + '</p><button onclick="localStorage.clear();location.reload();" style="margin-top:1rem;padding:0.5rem 1rem;background:#818cf8;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:0.9rem;">🔄 Clear Cache & Reload</button></div>';
+        }
+    }
+});
+
+function initApp() {
+    loadSettings();
+    applyTheme(state.settings.theme);
+    
+    state.coins = COINS_CONFIG;
+    state.timeframes = TIMEFRAMES_CONFIG;
+    
+    renderCoinsSidebar();
+    populateMainCoinSwap();
+    setupMainCoinDropdown();
+    renderTFTogglesWithTimers();
+    loadChartOptions();
+    
+    // Fetch data for all coins (for sorting)
+    fetchAllCoinsData();
+    
+    // Load last selected coin or default to first
+    const lastCoin = state.settings.lastCoin;
+    const coinToSelect = lastCoin && state.coins.find(c => c.symbol === lastCoin) 
+        ? lastCoin 
+        : state.coins[0]?.symbol;
+    
+    // In bridge mode, verify the coin is in the halal list
+    const validCoin = (IS_HAIAL_BRIDGE && coinToSelect && !state.coins.find(c => c.symbol === coinToSelect))
+        ? state.coins[0]?.symbol
+        : coinToSelect;
+    
+    if (validCoin) {
+        selectCoin(validCoin);
+    }
+    
+    setupEventListeners();
+    setupSortListener();
+    initFancySelects();
+    startTimerLoop();
+    
+    // Update confluence formula display immediately (before data loads)
+    updateMethodFormulaDisplay();
+    
+    // Refresh coin data periodically
+    setInterval(fetchAllCoinsData, 30000);
+}
+
+function setupSortListener() {
+    const sortSelect = document.getElementById('coinSortSelect');
+    if (sortSelect) {
+        sortSelect.addEventListener('change', (e) => {
+            state.currentSort = e.target.value;
+            renderCoinsSidebar();
+        });
+    }
+}
+
+// ============================================
+// FANCY SELECT INITIALIZATION
+// ============================================
+
+function initFancySelects() {
+    document.querySelectorAll('.fancy-select').forEach(wrapper => {
+        const select = wrapper.querySelector('select');
+        if (!select || wrapper.querySelector('.fancy-select-trigger')) return; // already init
+        
+        // Build trigger
+        const trigger = document.createElement('div');
+        trigger.className = 'fancy-select-trigger';
+        const selectedOpt = select.options[select.selectedIndex];
+        trigger.innerHTML = `<span class="fancy-select-label">${selectedOpt ? selectedOpt.text : ''}</span><span class="fancy-select-arrow">▾</span>`;
+        
+        // Build options panel
+        const optionsDiv = document.createElement('div');
+        optionsDiv.className = 'fancy-select-options';
+        Array.from(select.options).forEach(opt => {
+            const optEl = document.createElement('div');
+            optEl.className = `fancy-select-option${opt.selected ? ' selected' : ''}`;
+            optEl.dataset.value = opt.value;
+            optEl.textContent = opt.text;
+            optionsDiv.appendChild(optEl);
+        });
+        
+        wrapper.appendChild(trigger);
+        wrapper.appendChild(optionsDiv);
+        
+        // Toggle open
+        trigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Close all other fancy selects
+            document.querySelectorAll('.fancy-select.open').forEach(fs => {
+                if (fs !== wrapper) fs.classList.remove('open');
+            });
+            wrapper.classList.toggle('open');
+        });
+        
+        // Option click
+        optionsDiv.addEventListener('click', (e) => {
+            const optEl = e.target.closest('.fancy-select-option');
+            if (!optEl) return;
+            
+            const value = optEl.dataset.value;
+            select.value = value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            
+            // Update visual
+            trigger.querySelector('.fancy-select-label').textContent = optEl.textContent;
+            optionsDiv.querySelectorAll('.fancy-select-option').forEach(o => o.classList.remove('selected'));
+            optEl.classList.add('selected');
+            wrapper.classList.remove('open');
+        });
+    });
+    
+    // Global close handler
+    document.addEventListener('click', () => {
+        document.querySelectorAll('.fancy-select.open').forEach(fs => fs.classList.remove('open'));
+    });
+}
+
+// ============================================
+// SETTINGS MANAGEMENT
+// ============================================
+
+function loadSettings() {
+    const saved = localStorage.getItem('mtfcm_settings');
+    try { state.settings = saved ? JSON.parse(saved) : { ...DEFAULT_SETTINGS }; } catch(e) { console.warn('Settings parse error, using defaults'); state.settings = { ...DEFAULT_SETTINGS }; }
+    
+    // Migrate from old MTFCCM key
+    if (!saved) {
+        const oldSaved = localStorage.getItem('mtfccm_settings');
+        if (oldSaved) {
+            try { state.settings = JSON.parse(oldSaved); } catch(e) { state.settings = { ...DEFAULT_SETTINGS }; }
+            localStorage.setItem('mtfcm_settings', oldSaved);
+            localStorage.removeItem('mtfccm_settings');
+        }
+    }
+    
+    // Ensure patterns setting exists
+    if (state.settings.showPatterns === undefined) {
+        state.settings.showPatterns = true;
+    }
+    
+    // Migrate old theme name
+    if (state.settings.theme === 'light-colorful') {
+        state.settings.theme = 'colorful';
+        saveSettings();
+    }
+    
+    // Migrate old advancedMode to new viewMode
+    if (state.settings.advancedMode !== undefined && state.settings.viewMode === undefined) {
+        state.settings.viewMode = state.settings.advancedMode ? 'advanced' : 'clear';
+        delete state.settings.advancedMode;
+    }
+    
+    // Ensure viewMode exists
+    if (!state.settings.viewMode) {
+        state.settings.viewMode = 'advanced';
+    }
+    
+    // Ensure candlePopupType exists
+    if (!state.settings.candlePopupType) {
+        state.settings.candlePopupType = 'hover-tab';
+    }
+    
+    // Ensure signal settings defaults
+    if (state.settings.enableSignalSound === undefined) state.settings.enableSignalSound = true;
+    if (state.settings.enableSignalPopup === undefined) state.settings.enableSignalPopup = true;
+    if (state.settings.signalCooldownMs === undefined) state.settings.signalCooldownMs = 60000;
+    
+    // Apply signal cooldown from settings
+    state.signalState = state.signalState || { current: 'NEUTRAL', lastChange: 0, cooldownMs: 60000 };
+    state.signalState.cooldownMs = state.settings.signalCooldownMs;
+    
+    const tfStates = localStorage.getItem('mtfcm_timeframes');
+    if (tfStates) {
+        let parsed; try { parsed = JSON.parse(tfStates); } catch(e) { parsed = {}; }
+        state.timeframes.forEach(tf => {
+            if (parsed[tf.id] !== undefined) {
+                tf.enabled = parsed[tf.id];
+            }
+        });
+    }
+    
+    // Apply view mode (clear shows less, advanced shows everything)
+    if (state.settings.viewMode === 'clear') {
+        document.body.classList.add('clear-mode');
+    } else {
+        document.body.classList.remove('clear-mode');
+    }
+    
+    // Load inline form values
+    loadInlineSettings();
+}
+
+function loadInlineSettings() {
+    // Alert settings
+    const alertSecondsEl = document.getElementById('alertSeconds');
+    const minConfluenceEl = document.getElementById('minConfluence');
+    const enableSoundEl = document.getElementById('enableSound');
+    
+    if (alertSecondsEl) alertSecondsEl.value = state.settings.alertSeconds || 30;
+    if (minConfluenceEl) minConfluenceEl.value = state.settings.minConfluence || 2;
+    if (enableSoundEl) enableSoundEl.checked = state.settings.enableSound !== false;
+    
+    // Signal notification settings
+    const enableSignalSoundEl = document.getElementById('enableSignalSound');
+    const enableSignalPopupEl = document.getElementById('enableSignalPopup');
+    const signalCooldownEl = document.getElementById('signalCooldown');
+    
+    if (enableSignalSoundEl) enableSignalSoundEl.checked = state.settings.enableSignalSound !== false;
+    if (enableSignalPopupEl) enableSignalPopupEl.checked = state.settings.enableSignalPopup !== false;
+    if (signalCooldownEl) signalCooldownEl.value = String((state.settings.signalCooldownMs || 60000) / 1000);
+    
+    // Confluence settings
+    const weightMethodEl = document.getElementById('weightMethod');
+    const useStrengthModEl = document.getElementById('useStrengthMod');
+    const useVolumeModEl = document.getElementById('useVolumeMod');
+    const useIndicatorModEl = document.getElementById('useIndicatorMod');
+    
+    if (weightMethodEl) weightMethodEl.value = state.settings.weightMethod || 'linear';
+    if (useStrengthModEl) useStrengthModEl.checked = state.settings.useStrengthMod !== false;
+    if (useVolumeModEl) useVolumeModEl.checked = state.settings.useVolumeMod !== false;
+    if (useIndicatorModEl) useIndicatorModEl.checked = state.settings.useIndicatorMod !== false;
+    
+    // Display settings
+    const themeSelectEl = document.getElementById('themeSelect');
+    const viewModeSelectEl = document.getElementById('viewModeSelect');
+    const candlePopupTypeEl = document.getElementById('candlePopupType');
+    
+    if (themeSelectEl) themeSelectEl.value = state.settings.theme || 'dark';
+    if (viewModeSelectEl) viewModeSelectEl.value = state.settings.viewMode || 'advanced';
+    if (candlePopupTypeEl) candlePopupTypeEl.value = state.settings.candlePopupType || 'hover-tab';
+    
+    // Display Options (from TF Settings)
+    const showPriceInfoEl = document.getElementById('showPriceInfo');
+    const showTimersEl = document.getElementById('showTimers');
+    const showConfluenceBarEl = document.getElementById('showConfluenceBar');
+    
+    if (showPriceInfoEl) showPriceInfoEl.checked = state.settings.showPriceInfo !== false;
+    if (showTimersEl) showTimersEl.checked = state.settings.showTimers !== false;
+    if (showConfluenceBarEl) showConfluenceBarEl.checked = state.settings.showConfluenceBar !== false;
+}
+
+function saveSettings() {
+    // Save current coin
+    if (state.currentCoin) {
+        state.settings.lastCoin = state.currentCoin.symbol;
+    }
+    
+    localStorage.setItem('mtfcm_settings', JSON.stringify(state.settings));
+    
+    // Save per-coin confluence settings
+    if (state.addedCoinSettings) {
+        localStorage.setItem('mtfcm_addedCoinSettings', JSON.stringify(state.addedCoinSettings));
+    }
+    
+    const tfStates = {};
+    state.timeframes.forEach(tf => {
+        tfStates[tf.id] = tf.enabled;
+    });
+    localStorage.setItem('mtfcm_timeframes', JSON.stringify(tfStates));
+}
+
+function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    const themeBtn = document.getElementById('themeToggle');
+    if (themeBtn) {
+        if (theme === 'dark') themeBtn.textContent = '☀️';
+        else if (theme === 'light-simple') themeBtn.textContent = '🎨';
+        else if (theme === 'colorful') themeBtn.textContent = '🌙';
+        else themeBtn.textContent = '🌙';
+    }
+}
+
+function cycleTheme() {
+    const themes = ['dark', 'light-simple', 'colorful'];
+    const currentIndex = themes.indexOf(state.settings.theme);
+    const nextIndex = (currentIndex + 1) % themes.length;
+    state.settings.theme = themes[nextIndex];
+    applyTheme(state.settings.theme);
+    saveSettings();
+    
+    // Wait for CSS to apply before redrawing charts
+    requestAnimationFrame(() => {
+        renderTimeframeRows();
+        redrawAddedCoinCharts();
+    });
+    
+    const themeNames = { 'dark': 'Dark', 'light-simple': 'Light', 'colorful': 'Colorful' };
+    showKeyboardHint(`Theme: ${themeNames[themes[nextIndex]]}`);
+}
+
+// Redraw all added coin charts (for theme changes, resize, etc.)
+function redrawAddedCoinCharts() {
+    if (!state.addedCoinCandles) return;
+    Object.entries(state.addedCoinCandles).forEach(([key, data]) => {
+        const parts = key.split('-');
+        const tfId = parts[parts.length - 1];
+        const symbol = parts.slice(0, -1).join('-');
+        const canvasId = `chart-${symbol}-${tfId}`;
+        const chartTfId = `${symbol}-${tfId}`;
+        const canvas = document.getElementById(canvasId);
+        if (canvas && data.candles && data.coin) {
+            const analyzedData = state.data[chartTfId] || analyzeCandles(data.candles, chartTfId);
+            if (analyzedData) {
+                state.data[chartTfId] = analyzedData;
+                drawInteractiveChart(canvasId, analyzedData, chartTfId, { decimals: data.coin.decimals || 2 });
+            }
+        }
+    });
+}
+
+function showKeyboardHint(message) {
+    // Create or get hint element
+    let hint = document.getElementById('keyboard-hint');
+    if (!hint) {
+        hint = document.createElement('div');
+        hint.id = 'keyboard-hint';
+        hint.style.cssText = `
+            position: fixed;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--bg-secondary);
+            border: 1px solid var(--accent-color);
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            z-index: 9999;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            pointer-events: none;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        `;
+        document.body.appendChild(hint);
+    }
+    
+    hint.textContent = message;
+    hint.style.opacity = '1';
+    
+    clearTimeout(state.hintTimeout);
+    state.hintTimeout = setTimeout(() => {
+        hint.style.opacity = '0';
+    }, 1500);
+}
+
+function loadChartOptions() {
+    const rsiEl = document.getElementById('showChartRSI');
+    const macdEl = document.getElementById('showChartMACD');
+    const volumeEl = document.getElementById('showChartVolume');
+    const patternsEl = document.getElementById('showChartPatterns');
+    const maEl = document.getElementById('showChartMA');
+    const emaEl = document.getElementById('showChartEMA');
+    const vwapEl = document.getElementById('showChartVWAP');
+    const srEl = document.getElementById('showChartSR');
+    const divEl = document.getElementById('showRSIDivergence');
+    
+    if (rsiEl) rsiEl.checked = state.settings.showChartRSI || false;
+    if (macdEl) macdEl.checked = state.settings.showChartMACD || false;
+    if (volumeEl) volumeEl.checked = state.settings.showChartVolume !== false;
+    if (patternsEl) patternsEl.checked = state.settings.showPatterns !== false;
+    if (maEl) maEl.checked = state.settings.showChartMA || false;
+    if (emaEl) emaEl.checked = state.settings.showChartEMA !== false;
+    if (vwapEl) vwapEl.checked = state.settings.showChartVWAP || false;
+    if (srEl) srEl.checked = state.settings.showChartSR || false;
+    if (divEl) divEl.checked = state.settings.showRSIDivergence !== false;
+    const fvgEl = document.getElementById('showFVG');
+    if (fvgEl) fvgEl.checked = state.settings.showFVG !== false;
+    // Line color pickers
+    const srSup = document.getElementById('srSupportColor');
+    const srRes = document.getElementById('srResistanceColor');
+    const fvgB = document.getElementById('fvgBullColor');
+    const fvgBr = document.getElementById('fvgBearColor');
+    if (srSup) srSup.value = state.settings.srSupportColor || '#22c55e';
+    if (srRes) srRes.value = state.settings.srResistanceColor || '#ef4444';
+    if (fvgB) fvgB.value = state.settings.fvgBullColor || '#22c55e';
+    if (fvgBr) fvgBr.value = state.settings.fvgBearColor || '#ef4444';
+}
+
+// ============================================
+// COINS SIDEBAR
+// ============================================
+
+function renderCoinsSidebar() {
+    const container = document.getElementById('coinsList');
+    const watchlist = getWatchlist();
+    
+    // Get sorted coins based on current sort method
+    let sortedCoins = getSortedCoins();
+    
+    container.innerHTML = sortedCoins.map(coin => {
+        const coinInfo = state.coinData[coin.symbol] || {};
+        const change = coinInfo.change || 0;
+        const changeClass = change >= 0 ? 'positive' : 'negative';
+        const changeText = coinInfo.change !== undefined ? `${change >= 0 ? '+' : ''}${change.toFixed(2)}%` : '';
+        const isWatched = watchlist.includes(coin.symbol);
+        const confluenceScore = coinInfo.confluenceScore || 50;
+        const biasClass = confluenceScore >= 60 ? 'bull' : confluenceScore <= 40 ? 'bear' : 'neutral';
+        
+        // Halal verdict badge (bridge mode only)
+        const verdictInfo = HALAL_VERDICT_MAP[coin.shortName];
+        const verdictBadge = verdictInfo 
+            ? (verdictInfo.verdict === 'halal' 
+                ? '<span class="halal-verdict-badge halal" title="Halal — ' + (verdictInfo.source || '') + '">✅</span>'
+                : '<span class="halal-verdict-badge caution" title="Caution — ' + (verdictInfo.source || '') + '">⚠️</span>')
+            : '';
+        
+        return `
+        <div class="coin-item" data-symbol="${coin.symbol}">
+            <img src="${coin.icon}" alt="${coin.name}" onerror="this.style.display='none'">
+            <div class="coin-item-info">
+                <div class="coin-item-name">${coin.shortName} ${verdictBadge}</div>
+                <div class="coin-item-full-name">${coin.name}</div>
+                <div class="coin-item-quick-badge">
+                    <div class="quick-confluence-mini">
+                        <div class="quick-confluence-mini-fill ${biasClass}" style="width: ${confluenceScore}%"></div>
+                    </div>
+                    <span class="quick-bias-dot ${biasClass}"></span>
+                </div>
+            </div>
+            ${changeText ? `<span class="coin-item-change ${changeClass}">${changeText}</span>` : ''}
+            <button class="star-btn ${isWatched ? 'active' : ''}" data-symbol="${coin.symbol}">⭐</button>
+        </div>
+    `}).join('');
+    
+    container.querySelectorAll('.coin-item').forEach(item => {
+        item.addEventListener('click', (e) => {
+            // Don't select coin if clicking on star
+            if (e.target.classList.contains('star-btn')) return;
+            selectCoin(item.dataset.symbol);
+            closeSidebar();
+        });
+    });
+    
+    // Star button handlers
+    container.querySelectorAll('.star-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleWatchlist(btn.dataset.symbol);
+        });
+    });
+    
+    // Mark active coin
+    if (state.currentCoin) {
+        const activeItem = container.querySelector(`[data-symbol="${state.currentCoin.symbol}"]`);
+        if (activeItem) activeItem.classList.add('active');
+    }
+}
+
+function getSortedCoins() {
+    let coins = [...state.coins];
+    
+    switch (state.currentSort) {
+        case 'alpha':
+            coins.sort((a, b) => a.shortName.localeCompare(b.shortName));
+            break;
+        case 'alpha-desc':
+            coins.sort((a, b) => b.shortName.localeCompare(a.shortName));
+            break;
+        case 'volume':
+            coins.sort((a, b) => {
+                const volA = state.coinData[a.symbol]?.volume || 0;
+                const volB = state.coinData[b.symbol]?.volume || 0;
+                return volB - volA;
+            });
+            break;
+        case 'change':
+            coins.sort((a, b) => {
+                const changeA = state.coinData[a.symbol]?.change || 0;
+                const changeB = state.coinData[b.symbol]?.change || 0;
+                return changeB - changeA;
+            });
+            break;
+        case 'change-asc':
+            coins.sort((a, b) => {
+                const changeA = state.coinData[a.symbol]?.change || 0;
+                const changeB = state.coinData[b.symbol]?.change || 0;
+                return changeA - changeB;
+            });
+            break;
+        default:
+            // Keep default order
+            break;
+    }
+    
+    return coins;
+}
+
+async function fetchAllCoinsData() {
+    // Fetch 24h ticker data for all coins for sorting purposes
+    try {
+        const symbols = state.coins.map(c => c.symbol);
+        const promises = symbols.map(symbol => 
+            fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`)
+                .then(r => r.ok ? r.json() : null)
+                .catch(() => null)
+        );
+        
+        const results = await Promise.all(promises);
+        
+        results.forEach((data, i) => {
+            if (data) {
+                state.coinData[symbols[i]] = {
+                    price: parseFloat(data.lastPrice),
+                    change: parseFloat(data.priceChangePercent),
+                    volume: parseFloat(data.quoteVolume),
+                    high: parseFloat(data.highPrice),
+                    low: parseFloat(data.lowPrice)
+                };
+            }
+        });
+        
+        // Re-render if sorted by volume or change
+        if (['volume', 'change', 'change-asc'].includes(state.currentSort)) {
+            renderCoinsSidebar();
+        }
+    } catch (e) {
+        console.error('Failed to fetch coins data:', e);
+    }
+}
+
+function closeSidebar() {
+    document.getElementById('coinsSidebar')?.classList.remove('open');
+    document.getElementById('sidebarOverlay')?.classList.remove('active');
+}
+
+function openSidebar() {
+    document.getElementById('coinsSidebar')?.classList.add('open');
+    document.getElementById('sidebarOverlay')?.classList.add('active');
+}
+
+function filterCoins(query) {
+    const items = document.querySelectorAll('.coin-item');
+    const q = sanitizeInput(query).toLowerCase();
+    
+    items.forEach(item => {
+        const symbol = item.dataset.symbol.toLowerCase();
+        const name = item.querySelector('.coin-item-name')?.textContent.toLowerCase() || '';
+        const fullName = item.querySelector('.coin-item-full-name')?.textContent.toLowerCase() || '';
+        const match = symbol.includes(q) || name.includes(q) || fullName.includes(q);
+        item.style.display = match ? '' : 'none';
+    });
+}
+
+function selectCoin(symbol) {
+    state.currentCoin = state.coins.find(c => c.symbol === symbol);
+    state.candles = {};
+    state.patterns = {};
+    state.chartStates = {};
+    
+    document.querySelectorAll('.coin-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.symbol === symbol);
+    });
+    
+    if (state.currentCoin) {
+        const mainTfBlock = document.getElementById('mainTfBlock');
+        
+        if (mainTfBlock) {
+            mainTfBlock.dataset.symbol = symbol;
+        }
+        
+        // Sync custom coin dropdown trigger
+        updateDropdownTrigger(document.getElementById('mainCoinDropdown'), state.currentCoin);
+        
+        // Update main confluence header with coin icon and name
+        const confIcon = document.getElementById('mainConfIcon');
+        const confLabel = document.getElementById('mainConfLabel');
+        if (confIcon) { confIcon.src = state.currentCoin.icon || ''; confIcon.style.display = state.currentCoin.icon ? '' : 'none'; }
+        if (confLabel) confLabel.textContent = symbol.replace('USDT','');
+        
+        // Re-populate dropdown to update active/disabled/star states
+        populateMainCoinSwap();
+    }
+    
+    clearInterval(state.intervals.price);
+    clearInterval(state.intervals.candles);
+    
+    // Load confluence history for this coin
+    loadConfluenceHistory();
+    
+    // Initial REST fetch for full candle history
+    fetchPriceData();
+    fetchAllCandleData();
+    
+    // Connect WebSocket for live updates (replaces polling)
+    // Small delay to let initial REST data load first
+    setTimeout(() => wsConnect(), 1500);
+}
+
+// ============================================
+// REUSABLE FANCY DROPDOWN SYSTEM
+// ============================================
+
+// Populate any coin dropdown list with icons, names, stars
+function populateCoinDropdownList(listEl, selectedSymbol, disabledSymbols = [], showStars = true) {
+    if (!listEl) return;
+    const watchlist = getWatchlist();
+    
+    listEl.innerHTML = state.coins.map(coin => {
+        const isActive = coin.symbol === selectedSymbol;
+        const isDisabled = disabledSymbols.includes(coin.symbol);
+        const isWatched = watchlist.includes(coin.symbol);
+        const vInfo = HALAL_VERDICT_MAP[coin.shortName];
+        const vBadge = vInfo ? (vInfo.verdict === 'halal' ? ' ✅' : ' ⚠️') : '';
+        return `<div class="coin-dropdown-item ${isActive ? 'active' : ''} ${isDisabled ? 'disabled' : ''}" data-symbol="${coin.symbol}">
+            <img class="coin-item-icon" src="${coin.icon}" onerror="this.style.visibility='hidden'">
+            <span class="coin-item-name">${coin.shortName}${vBadge}</span>
+            <span class="coin-item-full">${coin.name}</span>
+            ${showStars ? `<span class="coin-item-star ${isWatched ? 'starred' : ''}" data-star-symbol="${coin.symbol}" title="${isWatched ? 'Remove from watchlist' : 'Add to watchlist'}">${isWatched ? '★' : '☆'}</span>` : ''}
+        </div>`;
+    }).join('');
+}
+
+// Filter coin dropdown items by search query
+function filterCoinDropdownList(listEl, query) {
+    if (!listEl) return;
+    const items = listEl.querySelectorAll('.coin-dropdown-item');
+    const q = query.toLowerCase().trim();
+    items.forEach(item => {
+        const symbol = item.dataset.symbol.toLowerCase();
+        const name = item.querySelector('.coin-item-full')?.textContent.toLowerCase() || '';
+        const shortName = item.querySelector('.coin-item-name')?.textContent.toLowerCase() || '';
+        item.style.display = (!q || symbol.includes(q) || name.includes(q) || shortName.includes(q)) ? 'flex' : 'none';
+    });
+}
+
+// Update the trigger button display for a fancy dropdown
+function updateDropdownTrigger(dropdownEl, coin) {
+    if (!dropdownEl || !coin) return;
+    const icon = dropdownEl.querySelector('.coin-dd-icon');
+    const name = dropdownEl.querySelector('.coin-dd-name');
+    if (icon) { icon.src = coin.icon; icon.style.display = 'inline'; icon.onerror = () => icon.style.display = 'none'; }
+    if (name) name.textContent = coin.shortName;
+}
+
+// Setup interactions for any fancy coin dropdown
+function setupCoinDropdown(dropdownEl, onSelect) {
+    if (!dropdownEl) return;
+    const trigger = dropdownEl.querySelector('.coin-dropdown-trigger');
+    const search = dropdownEl.querySelector('.coin-dropdown-search');
+    const list = dropdownEl.querySelector('.coin-dropdown-list');
+    if (!trigger) return;
+    
+    // Toggle dropdown
+    trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Close all other dropdowns first
+        document.querySelectorAll('.custom-coin-dropdown.open').forEach(dd => {
+            if (dd !== dropdownEl) dd.classList.remove('open');
+        });
+        dropdownEl.classList.toggle('open');
+        if (dropdownEl.classList.contains('open') && search) {
+            search.value = '';
+            filterCoinDropdownList(list, '');
+            setTimeout(() => search.focus(), 50);
+        }
+    });
+    
+    // Search filter
+    if (search) {
+        search.addEventListener('input', (e) => filterCoinDropdownList(list, e.target.value));
+        search.addEventListener('click', (e) => e.stopPropagation());
+    }
+    
+    // Item click (coin select or star toggle)
+    if (list) {
+        list.addEventListener('click', (e) => {
+            // Handle star click
+            const star = e.target.closest('.coin-item-star');
+            if (star) {
+                e.stopPropagation();
+                const symbol = star.dataset.starSymbol;
+                if (symbol) {
+                    toggleWatchlist(symbol);
+                    const watchlist = getWatchlist();
+                    const isWatched = watchlist.includes(symbol);
+                    star.textContent = isWatched ? '★' : '☆';
+                    star.classList.toggle('starred', isWatched);
+                    star.title = isWatched ? 'Remove from watchlist' : 'Add to watchlist';
+                    renderCoins();
+                }
+                return;
+            }
+            // Handle coin select
+            const item = e.target.closest('.coin-dropdown-item');
+            if (!item || item.classList.contains('disabled')) return;
+            const symbol = item.dataset.symbol;
+            if (symbol) {
+                onSelect(symbol);
+            }
+            dropdownEl.classList.remove('open');
+        });
+    }
+}
+
+// Generate fancy dropdown HTML
+function buildFancyDropdownHTML(id, selectedSymbol) {
+    const coin = state.coins.find(c => c.symbol === selectedSymbol);
+    const iconSrc = coin ? coin.icon : '';
+    const displayName = coin ? coin.shortName : '---';
+    return `
+        <div class="custom-coin-dropdown" id="${id}">
+            <button class="coin-dropdown-trigger" type="button">
+                <img class="coin-dd-icon" src="${iconSrc}" onerror="this.style.display='none'">
+                <span class="coin-dd-name">${displayName}</span>
+                <span class="coin-dd-arrow">▾</span>
+            </button>
+            <div class="coin-dropdown-menu">
+                <input type="text" class="coin-dropdown-search" placeholder="Search coins...">
+                <div class="coin-dropdown-list"></div>
+            </div>
+        </div>
+    `;
+}
+
+// Populate the main coin dropdown
+function populateMainCoinSwap() {
+    const dropdown = document.getElementById('mainCoinDropdown');
+    const list = dropdown?.querySelector('.coin-dropdown-list');
+    if (!dropdown) return;
+    
+    // Update trigger
+    updateDropdownTrigger(dropdown, state.currentCoin);
+    
+    // Build disabled list: added coins
+    const disabled = [...state.addedCoins];
+    populateCoinDropdownList(list, state.currentCoin?.symbol, disabled, true);
+}
+
+// Setup main coin dropdown interactions
+function setupMainCoinDropdown() {
+    const dropdown = document.getElementById('mainCoinDropdown');
+    if (!dropdown) return;
+    
+    setupCoinDropdown(dropdown, (symbol) => {
+        if (symbol !== state.currentCoin?.symbol) {
+            selectCoin(symbol);
+        }
+    });
+}
+
+// Global: close all fancy dropdowns on outside click
+document.addEventListener('click', (e) => {
+    document.querySelectorAll('.custom-coin-dropdown.open').forEach(dd => {
+        if (!dd.contains(e.target)) {
+            dd.classList.remove('open');
+        }
+    });
+});
+
+// ============================================
+// BINANCE API
+// ============================================
+
+const BINANCE_API = 'https://api.binance.com/api/v3';
+const BINANCE_WS = 'wss://stream.binance.com:9443/stream?streams=';
+
+// ============================================
+// WEBSOCKET LIVE DATA MANAGER
+// ============================================
+
+function wsConnect() {
+    // Close existing connection
+    wsDisconnect();
+    
+    if (!state.currentCoin) return;
+    
+    // Build stream list
+    const streams = [];
+    const mainSym = state.currentCoin.symbol.toLowerCase();
+    
+    // Main coin ticker (real-time price)
+    streams.push(`${mainSym}@miniTicker`);
+    
+    // Main coin klines (real-time candle updates)
+    const enabledTFs = state.timeframes.filter(tf => tf.enabled);
+    enabledTFs.forEach(tf => {
+        streams.push(`${mainSym}@kline_${tf.id}`);
+    });
+    
+    // Added coins tickers
+    state.addedCoins.forEach(sym => {
+        streams.push(`${sym.toLowerCase()}@miniTicker`);
+    });
+    
+    // Added coins klines
+    state.addedCoins.forEach(sym => {
+        const coinTfState = state.addedCoinTfState?.[sym] || [];
+        coinTfState.filter(tf => tf.enabled).forEach(ctf => {
+            streams.push(`${sym.toLowerCase()}@kline_${ctf.id}`);
+        });
+    });
+    
+    if (streams.length === 0) return;
+    
+    const url = BINANCE_WS + streams.join('/');
+    
+    try {
+        const ws = new WebSocket(url);
+        state.ws = ws;
+        
+        ws.onopen = () => {
+            state.wsReconnect = 0;
+            const dot = document.getElementById('connectionDot');
+            if (dot) { dot.className = 'connection-dot live'; dot.title = 'Live (WebSocket)'; }
+            
+            // Stop REST polling since WebSocket is active
+            clearInterval(state.intervals.price);
+            clearInterval(state.intervals.candles);
+            state.intervals.price = null;
+            state.intervals.candles = null;
+        };
+        
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (!msg.data) return;
+                const d = msg.data;
+                
+                if (d.e === '24hrMiniTicker') {
+                    wsHandleTicker(d);
+                } else if (d.e === 'kline') {
+                    wsHandleKline(d);
+                }
+            } catch {}
+        };
+        
+        ws.onclose = () => {
+            state.ws = null;
+            // Auto-reconnect with backoff
+            if (state.wsReconnect < 5) {
+                const delay = Math.min(2000 * Math.pow(2, state.wsReconnect), 30000);
+                state.wsReconnect++;
+                setTimeout(wsConnect, delay);
+            } else {
+                // Fallback to REST polling
+                wsFallbackToREST();
+            }
+        };
+        
+        ws.onerror = () => {
+            // Will trigger onclose, which handles reconnect
+        };
+        
+    } catch (e) {
+        console.warn('WebSocket not available, using REST polling', e);
+        wsFallbackToREST();
+    }
+}
+
+function wsDisconnect() {
+    if (state.ws) {
+        state.ws.onclose = null; // Prevent auto-reconnect
+        state.ws.close();
+        state.ws = null;
+    }
+}
+
+function wsFallbackToREST() {
+    const dot = document.getElementById('connectionDot');
+    if (dot) { dot.className = 'connection-dot'; dot.title = 'Connected (REST)'; }
+    // Restart REST polling
+    if (!state.intervals.price) {
+        state.intervals.price = setInterval(fetchPriceData, 2000);
+    }
+    if (!state.intervals.candles) {
+        state.intervals.candles = setInterval(fetchAllCandleData, 5000);
+    }
+}
+
+function wsHandleTicker(d) {
+    const symbol = d.s; // e.g. "BTCUSDT"
+    const price = parseFloat(d.c);   // Close price
+    const open = parseFloat(d.o);    // Open price 24h
+    const high = parseFloat(d.h);    // 24h high
+    const low = parseFloat(d.l);     // 24h low
+    const volume = parseFloat(d.v);  // Base volume
+    const quoteVol = parseFloat(d.q); // Quote volume
+    const change = open > 0 ? ((price - open) / open) * 100 : 0;
+    
+    if (state.currentCoin && symbol === state.currentCoin.symbol) {
+        // Update main coin display
+        const priceEl = document.getElementById('currentPrice');
+        if (priceEl) priceEl.textContent = '$' + price.toFixed(state.currentCoin.decimals);
+        
+        const highEl = document.getElementById('high24h');
+        const lowEl = document.getElementById('low24h');
+        if (highEl) highEl.textContent = '$' + high.toFixed(state.currentCoin.decimals);
+        if (lowEl) lowEl.textContent = '$' + low.toFixed(state.currentCoin.decimals);
+        
+        const changeEl = document.getElementById('priceChange');
+        if (changeEl) {
+            changeEl.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
+            changeEl.className = change >= 0 ? 'price-change bull' : 'price-change bear';
+        }
+        
+        // Update coinData for sorting
+        if (!state.coinData[symbol]) state.coinData[symbol] = {};
+        state.coinData[symbol].price = price;
+        state.coinData[symbol].high24h = high;
+        state.coinData[symbol].low24h = low;
+        state.coinData[symbol].change = change;
+        
+    } else if (state.addedCoins.includes(symbol)) {
+        // Update added coin price display
+        const coin = state.coins.find(c => c.symbol === symbol);
+        if (!coin) return;
+        
+        const priceEl = document.getElementById(`blockPrice-${symbol}`);
+        if (priceEl) {
+            priceEl.innerHTML = `
+                <span class="price-value">$${price.toFixed(coin.decimals)}</span>
+                <span class="price-change ${change >= 0 ? 'bull' : 'bear'}">${change >= 0 ? '+' : ''}${change.toFixed(2)}%</span>
+            `;
+        }
+        if (!state.addedCoinData) state.addedCoinData = {};
+        if (!state.addedCoinData[symbol]) state.addedCoinData[symbol] = {};
+        state.addedCoinData[symbol].price = price;
+        state.addedCoinData[symbol].change = change;
+    }
+}
+
+// Throttle kline renders to max 1 per second per timeframe
+const _klineThrottles = {};
+
+function wsHandleKline(d) {
+    const k = d.k;
+    const symbol = d.s;
+    const interval = k.i;       // e.g. "5m"
+    const isClosed = k.x;       // Is this kline closed?
+    
+    const candle = {
+        openTime: k.t,
+        open: parseFloat(k.o),
+        high: parseFloat(k.h),
+        low: parseFloat(k.l),
+        close: parseFloat(k.c),
+        volume: parseFloat(k.v),
+        closeTime: k.T
+    };
+    
+    // Determine which candle array to update
+    const isMain = state.currentCoin && symbol === state.currentCoin.symbol;
+    let candleArr;
+    
+    if (isMain) {
+        candleArr = state.candles[interval];
+    } else if (state.addedCoins.includes(symbol)) {
+        if (!state.addedCoinData) state.addedCoinData = {};
+        if (!state.addedCoinData[symbol]) state.addedCoinData[symbol] = {};
+        if (!state.addedCoinData[symbol].candles) state.addedCoinData[symbol].candles = {};
+        candleArr = state.addedCoinData[symbol].candles[interval];
+    }
+    
+    if (!candleArr || candleArr.length === 0) return;
+    
+    // Update the last candle in-place, or append if new closed candle
+    const lastCandle = candleArr[candleArr.length - 1];
+    if (lastCandle && candle.openTime === lastCandle.openTime) {
+        // Update in-place (same candle still forming)
+        lastCandle.high = candle.high;
+        lastCandle.low = candle.low;
+        lastCandle.close = candle.close;
+        lastCandle.volume = candle.volume;
+    } else if (isClosed) {
+        // New candle closed — append and trim
+        candleArr.push(candle);
+        if (candleArr.length > CANDLE_LIMIT) candleArr.shift();
+    }
+    
+    // Throttled re-render (max 1/sec per TF to avoid flooding)
+    const throttleKey = `${symbol}_${interval}`;
+    if (_klineThrottles[throttleKey]) return;
+    _klineThrottles[throttleKey] = true;
+    
+    setTimeout(() => {
+        _klineThrottles[throttleKey] = false;
+        
+        if (isMain) {
+            // Re-analyze and re-render this TF
+            state.patterns[interval] = detectAllPatterns(candleArr);
+            state.data[interval] = analyzeCandles(candleArr, interval);
+            renderTimeframeRows();
+            calculateConfluence();
+        } else {
+            // Re-render added coin TF
+            calculateAddedCoinConfluence(symbol);
+        }
+    }, 1000);
+}
+
+async function fetchPriceData() {
+    if (!state.currentCoin) return;
+    
+    const dot = document.getElementById('connectionDot');
+    try {
+        if (dot) dot.className = 'connection-dot loading';
+        
+        // Fetch main coin + all added coins in parallel
+        const allSymbols = [state.currentCoin.symbol, ...state.addedCoins];
+        const results = await Promise.allSettled(
+            allSymbols.map(sym => fetch(`${BINANCE_API}/ticker/24hr?symbol=${sym}`).then(r => r.json()))
+        );
+        
+        // Update main coin
+        if (results[0]?.status === 'fulfilled') {
+            updatePriceDisplay(results[0].value);
+        }
+        
+        // Update added coins
+        for (let i = 1; i < results.length; i++) {
+            if (results[i]?.status === 'fulfilled') {
+                const data = results[i].value;
+                const symbol = allSymbols[i];
+                const coin = state.coins.find(c => c.symbol === symbol);
+                if (!coin) continue;
+                
+                const price = parseFloat(data.lastPrice);
+                const change = parseFloat(data.priceChangePercent);
+                
+                // Update price display
+                const priceEl = document.getElementById(`blockPrice-${symbol}`);
+                if (priceEl) {
+                    priceEl.innerHTML = `
+                        <span class="price-value">$${price.toFixed(coin.decimals)}</span>
+                        <span class="price-change ${change >= 0 ? 'bull' : 'bear'}">${change >= 0 ? '+' : ''}${change.toFixed(2)}%</span>
+                    `;
+                }
+                
+                if (state.addedCoinData?.[symbol]) {
+                    state.addedCoinData[symbol].price = price;
+                    state.addedCoinData[symbol].change = change;
+                }
+            }
+        }
+        
+        if (dot) { dot.className = 'connection-dot'; dot.title = 'Connected'; }
+    } catch (error) {
+        console.error('Error fetching price:', error);
+        if (dot) { dot.className = 'connection-dot error'; dot.title = 'Connection error'; }
+    }
+}
+
+async function fetchCandleData(timeframe) {
+    if (!state.currentCoin) return null;
+    
+    try {
+        // Fetch most recent candles
+        const response = await fetch(
+            `${BINANCE_API}/klines?symbol=${state.currentCoin.symbol}&interval=${timeframe}&limit=${CANDLE_LIMIT}`
+        );
+        const data = await response.json();
+        
+        return data.map(candle => ({
+            openTime: candle[0],
+            open: parseFloat(candle[1]),
+            high: parseFloat(candle[2]),
+            low: parseFloat(candle[3]),
+            close: parseFloat(candle[4]),
+            volume: parseFloat(candle[5]),
+            closeTime: candle[6]
+        }));
+    } catch (error) {
+        console.error(`Error fetching ${timeframe} candles:`, error);
+        return null;
+    }
+}
+
+async function fetchAllCandleData() {
+    const enabledTFs = state.timeframes.filter(tf => tf.enabled);
+    
+    // Fetch all timeframes in parallel for faster loading
+    const results = await Promise.allSettled(
+        enabledTFs.map(async (tf) => {
+            const candles = await fetchCandleData(tf.id);
+            return { tf, candles };
+        })
+    );
+    
+    results.forEach(result => {
+        if (result.status === 'fulfilled' && result.value.candles?.length > 0) {
+            const { tf, candles } = result.value;
+            state.candles[tf.id] = candles;
+            state.patterns[tf.id] = detectAllPatterns(candles);
+            state.data[tf.id] = analyzeCandles(candles, tf.id);
+        }
+    });
+    
+    renderTimeframeRows();
+    calculateConfluence();
+    
+    // Also refresh all added coins in parallel
+    if (state.addedCoins.length > 0) {
+        const addedPromises = [];
+        state.addedCoins.forEach(symbol => {
+            const coin = state.coins.find(c => c.symbol === symbol);
+            if (!coin) return;
+            const coinTfState = state.addedCoinTfState?.[symbol] || [];
+            const coinEnabledTFs = coinTfState.filter(tf => tf.enabled);
+            coinEnabledTFs.forEach(ctf => {
+                const mainTf = state.timeframes.find(t => t.id === ctf.id);
+                if (mainTf) {
+                    addedPromises.push(fetchAddedCoinTimeframe(symbol, coin, mainTf));
+                }
+            });
+        });
+        await Promise.allSettled(addedPromises);
+        // Recalculate confluence for each added coin
+        state.addedCoins.forEach(symbol => calculateAddedCoinConfluence(symbol));
+    }
+}
+
+// ============================================
+// CANDLESTICK PATTERN DETECTION
+// ============================================
+
+function detectAllPatterns(candles) {
+    const patterns = [];
+    
+    for (let i = 0; i < candles.length; i++) {
+        // Single candle patterns
+        const single = detectSinglePatterns(candles, i);
+        if (single) patterns.push({ index: i, ...single });
+        
+        // Two candle patterns (need at least 2 candles)
+        if (i >= 1) {
+            const double = detectDoublePatterns(candles, i);
+            if (double) patterns.push({ index: i, ...double });
+        }
+        
+        // Three candle patterns (need at least 3 candles)
+        if (i >= 2) {
+            const triple = detectTriplePatterns(candles, i);
+            if (triple) patterns.push({ index: i, ...triple });
+        }
+    }
+    
+    return patterns;
+}
+
+function detectSinglePatterns(candles, i) {
+    const c = candles[i];
+    const range = c.high - c.low;
+    if (range === 0) return null;
+    
+    const body = Math.abs(c.close - c.open);
+    const bodyPct = body / range;
+    const upperWick = c.high - Math.max(c.open, c.close);
+    const lowerWick = Math.min(c.open, c.close) - c.low;
+    const upperWickPct = upperWick / range;
+    const lowerWickPct = lowerWick / range;
+    const isBullish = c.close > c.open;
+    
+    // Doji: Very small body
+    if (bodyPct < 0.1) {
+        return { pattern: 'doji', ...PATTERNS.doji };
+    }
+    
+    // Marubozu: Full body, almost no wicks
+    if (bodyPct > 0.9 && upperWickPct < 0.05 && lowerWickPct < 0.05) {
+        return { pattern: 'marubozu', ...PATTERNS.marubozu, type: isBullish ? 'bullish' : 'bearish' };
+    }
+    
+    // Spinning Top: Small body with wicks on both sides
+    if (bodyPct < 0.3 && upperWickPct > 0.25 && lowerWickPct > 0.25) {
+        return { pattern: 'spinningTop', ...PATTERNS.spinningTop };
+    }
+    
+    // Check trend for hammer/shooting star patterns
+    const trend = getTrend(candles, i, 5);
+    
+    // Hammer / Hanging Man: Small body at top, long lower wick
+    if (bodyPct < 0.35 && lowerWickPct > 0.6 && upperWickPct < 0.1) {
+        if (trend === 'down') {
+            return { pattern: 'hammer', ...PATTERNS.hammer };
+        } else if (trend === 'up') {
+            return { pattern: 'hangingMan', ...PATTERNS.hangingMan };
+        }
+    }
+    
+    // Inverted Hammer / Shooting Star: Small body at bottom, long upper wick
+    if (bodyPct < 0.35 && upperWickPct > 0.6 && lowerWickPct < 0.1) {
+        if (trend === 'down') {
+            return { pattern: 'invertedHammer', ...PATTERNS.invertedHammer };
+        } else if (trend === 'up') {
+            return { pattern: 'shootingStar', ...PATTERNS.shootingStar };
+        }
+    }
+    
+    return null;
+}
+
+function detectDoublePatterns(candles, i) {
+    const curr = candles[i];
+    const prev = candles[i - 1];
+    
+    const currBody = Math.abs(curr.close - curr.open);
+    const prevBody = Math.abs(prev.close - prev.open);
+    const currBullish = curr.close > curr.open;
+    const prevBullish = prev.close > prev.open;
+    
+    // Bullish Engulfing
+    if (!prevBullish && currBullish && 
+        curr.open < prev.close && curr.close > prev.open &&
+        currBody > prevBody) {
+        return { pattern: 'bullishEngulfing', ...PATTERNS.bullishEngulfing };
+    }
+    
+    // Bearish Engulfing
+    if (prevBullish && !currBullish && 
+        curr.open > prev.close && curr.close < prev.open &&
+        currBody > prevBody) {
+        return { pattern: 'bearishEngulfing', ...PATTERNS.bearishEngulfing };
+    }
+    
+    // Bullish Harami
+    if (!prevBullish && currBullish &&
+        curr.open > prev.close && curr.close < prev.open &&
+        currBody < prevBody * 0.5) {
+        return { pattern: 'bullishHarami', ...PATTERNS.bullishHarami };
+    }
+    
+    // Bearish Harami
+    if (prevBullish && !currBullish &&
+        curr.open < prev.close && curr.close > prev.open &&
+        currBody < prevBody * 0.5) {
+        return { pattern: 'bearishHarami', ...PATTERNS.bearishHarami };
+    }
+    
+    // Piercing Line
+    if (!prevBullish && currBullish &&
+        curr.open < prev.low &&
+        curr.close > (prev.open + prev.close) / 2 &&
+        curr.close < prev.open) {
+        return { pattern: 'piercingLine', ...PATTERNS.piercingLine };
+    }
+    
+    // Dark Cloud Cover
+    if (prevBullish && !currBullish &&
+        curr.open > prev.high &&
+        curr.close < (prev.open + prev.close) / 2 &&
+        curr.close > prev.open) {
+        return { pattern: 'darkCloudCover', ...PATTERNS.darkCloudCover };
+    }
+    
+    // Tweezer Top
+    if (Math.abs(curr.high - prev.high) / prev.high < 0.001 &&
+        prevBullish && !currBullish) {
+        return { pattern: 'tweezerTop', ...PATTERNS.tweezerTop };
+    }
+    
+    // Tweezer Bottom
+    if (Math.abs(curr.low - prev.low) / prev.low < 0.001 &&
+        !prevBullish && currBullish) {
+        return { pattern: 'tweezerBottom', ...PATTERNS.tweezerBottom };
+    }
+    
+    return null;
+}
+
+function detectTriplePatterns(candles, i) {
+    const c1 = candles[i - 2];
+    const c2 = candles[i - 1];
+    const c3 = candles[i];
+    
+    const c1Bullish = c1.close > c1.open;
+    const c2Bullish = c2.close > c2.open;
+    const c3Bullish = c3.close > c3.open;
+    
+    const c1Body = Math.abs(c1.close - c1.open);
+    const c2Body = Math.abs(c2.close - c2.open);
+    const c3Body = Math.abs(c3.close - c3.open);
+    const c1Range = c1.high - c1.low;
+    const c2Range = c2.high - c2.low;
+    
+    // Morning Star
+    if (!c1Bullish && c3Bullish &&
+        c2Body < c1Body * 0.3 &&
+        c2.close < c1.close && c2.close < c3.open &&
+        c3.close > (c1.open + c1.close) / 2) {
+        return { pattern: 'morningStar', ...PATTERNS.morningStar };
+    }
+    
+    // Evening Star
+    if (c1Bullish && !c3Bullish &&
+        c2Body < c1Body * 0.3 &&
+        c2.close > c1.close && c2.close > c3.open &&
+        c3.close < (c1.open + c1.close) / 2) {
+        return { pattern: 'eveningStar', ...PATTERNS.eveningStar };
+    }
+    
+    // Three White Soldiers
+    if (c1Bullish && c2Bullish && c3Bullish &&
+        c2.open > c1.open && c2.close > c1.close &&
+        c3.open > c2.open && c3.close > c2.close &&
+        c1Body > c1Range * 0.6 && c2Body > c2Range * 0.6) {
+        return { pattern: 'threeWhiteSoldiers', ...PATTERNS.threeWhiteSoldiers };
+    }
+    
+    // Three Black Crows
+    if (!c1Bullish && !c2Bullish && !c3Bullish &&
+        c2.open < c1.open && c2.close < c1.close &&
+        c3.open < c2.open && c3.close < c2.close &&
+        c1Body > c1Range * 0.6 && c2Body > c2Range * 0.6) {
+        return { pattern: 'threeBlackCrows', ...PATTERNS.threeBlackCrows };
+    }
+    
+    return null;
+}
+
+function getTrend(candles, currentIndex, lookback) {
+    if (currentIndex < lookback) return 'neutral';
+    
+    let upCount = 0, downCount = 0;
+    for (let i = currentIndex - lookback; i < currentIndex; i++) {
+        if (candles[i].close > candles[i].open) upCount++;
+        else downCount++;
+    }
+    
+    if (upCount > downCount + 1) return 'up';
+    if (downCount > upCount + 1) return 'down';
+    return 'neutral';
+}
+
+// ============================================
+// TECHNICAL ANALYSIS
+// ============================================
+
+function analyzeCandles(candles, tfId) {
+    if (!candles || candles.length < 2) return null;
+    
+    const current = candles[candles.length - 1];
+    const previous = candles[candles.length - 2];
+    
+    const isBullish = current.close > current.open;
+    const range = current.high - current.low;
+    const bodySize = Math.abs(current.close - current.open);
+    const bodyPct = range > 0 ? (bodySize / range) * 100 : 0;
+    
+    const upperWick = current.high - Math.max(current.open, current.close);
+    const lowerWick = Math.min(current.open, current.close) - current.low;
+    const upperWickPct = range > 0 ? (upperWick / range) * 100 : 0;
+    const lowerWickPct = range > 0 ? (lowerWick / range) * 100 : 0;
+    
+    const changePct = current.open !== 0 ? ((current.close - current.open) / current.open) * 100 : 0;
+    
+    const volumes = candles.slice(-VOLUME_CONFIG.avgPeriod).map(c => c.volume);
+    const avgVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
+    const volumeRatio = avgVolume > 0 ? current.volume / avgVolume : 1;
+    
+    const closePosition = range > 0 ? (current.close - current.low) / range : 0.5;
+    const buyPct = closePosition * 100;
+    const sellPct = (1 - closePosition) * 100;
+    
+    const rsi = calculateRSI(candles, RSI_CONFIG.period);
+    const rsiArray = calculateRSIArray(candles, RSI_CONFIG.period);
+    const macd = calculateMACD(candles);
+    const macdArray = calculateMACDArray(candles);
+    
+    // Trend analysis - EMA alignment
+    const closes = candles.map(c => c.close);
+    const ema21 = calculateEMA(closes, 21);
+    const ema50 = closes.length >= 50 ? calculateEMA(closes, 50) : ema21;
+    const priceAboveEma21 = current.close > ema21;
+    const priceAboveEma50 = current.close > ema50;
+    const ema21AboveEma50 = ema21 > ema50;
+    
+    // Previous EMAs for trend direction
+    const prevCloses = closes.slice(0, -1);
+    const prevEma21 = prevCloses.length >= 21 ? calculateEMA(prevCloses, 21) : ema21;
+    const ema21Rising = ema21 > prevEma21;
+    
+    // RSI momentum direction
+    const prevRsi = rsiArray.length >= 2 ? rsiArray[rsiArray.length - 2] : rsi;
+    const rsiRising = rsi > prevRsi;
+    
+    const trend = {
+        ema21, ema50,
+        priceAboveEma21, priceAboveEma50, ema21AboveEma50, ema21Rising,
+        rsiRising
+    };
+    
+    const alerts = generateAlerts(rsi, macd, volumeRatio, bodyPct, upperWickPct, lowerWickPct, current, previous);
+    
+    return {
+        tfId,
+        current,
+        previous,
+        candles,
+        isBullish,
+        bodyPct,
+        upperWickPct,
+        lowerWickPct,
+        changePct,
+        volumeRatio,
+        buyPct,
+        sellPct,
+        rsi,
+        rsiArray,
+        macd,
+        macdArray,
+        trend,
+        alerts
+    };
+}
+
+function generateAlerts(rsi, macd, volumeRatio, bodyPct, upperWickPct, lowerWickPct, current, previous) {
+    // Engulfing detection
+    let bullEngulfing = false, bearEngulfing = false;
+    if (current && previous) {
+        const currBody = Math.abs(current.close - current.open);
+        const prevBody = Math.abs(previous.close - previous.open);
+        const currBull = current.close >= current.open;
+        const prevBull = previous.close >= previous.open;
+        bullEngulfing = currBull && !prevBull && currBody > prevBody && current.close > previous.open && current.open < previous.close;
+        bearEngulfing = !currBull && prevBull && currBody > prevBody && current.open > previous.close && current.close < previous.open;
+    }
+    
+    return {
+        overbought: rsi >= RSI_CONFIG.overbought,
+        extremeOB: rsi >= RSI_CONFIG.extremeOverbought,
+        oversold: rsi <= RSI_CONFIG.oversold,
+        extremeOS: rsi <= RSI_CONFIG.extremeOversold,
+        highVol: volumeRatio >= VOLUME_CONFIG.highThreshold && volumeRatio < VOLUME_CONFIG.spikeThreshold,
+        volSpike: volumeRatio >= VOLUME_CONFIG.spikeThreshold,
+        lowVol: volumeRatio <= VOLUME_CONFIG.lowThreshold,
+        indecision: bodyPct <= 20,
+        bigBody: bodyPct >= 80,
+        rejectHigh: upperWickPct >= 50,
+        rejectLow: lowerWickPct >= 50,
+        macdBull: macd.isBullish,
+        macdBear: !macd.isBullish,
+        macdCrossUp: macd.crossedUp,
+        macdCrossDown: macd.crossedDown,
+        bullEngulfing,
+        bearEngulfing
+    };
+}
+
+function calculateRSI(candles, period = 14) {
+    if (candles.length < period + 1) return 50;
+    
+    const closes = candles.map(c => c.close);
+    let gains = 0, losses = 0;
+    
+    for (let i = 1; i <= period; i++) {
+        const change = closes[closes.length - period - 1 + i] - closes[closes.length - period - 2 + i];
+        if (change >= 0) gains += change;
+        else losses += Math.abs(change);
+    }
+    
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    
+    if (avgLoss === 0) return 100;
+    return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+function calculateRSIArray(candles, period = 14) {
+    const result = [];
+    const closes = candles.map(c => c.close);
+    
+    for (let i = period; i < closes.length; i++) {
+        let gains = 0, losses = 0;
+        for (let j = i - period + 1; j <= i; j++) {
+            const change = closes[j] - closes[j - 1];
+            if (change >= 0) gains += change;
+            else losses += Math.abs(change);
+        }
+        const avgGain = gains / period;
+        const avgLoss = losses / period;
+        result.push(avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss)));
+    }
+    return result;
+}
+
+// RSI Divergence Detection
+// Finds pivot highs/lows in both price and RSI, compares slopes
+function detectRSIDivergence(candles, rsiData) {
+    const divergences = [];
+    if (!candles || !rsiData || candles.length < 10 || rsiData.length < 10) return divergences;
+    
+    const len = Math.min(candles.length, rsiData.length);
+    const lookback = 5; // candles each side for pivot
+    
+    // Find pivot lows and highs
+    const pivotLows = [];
+    const pivotHighs = [];
+    
+    for (let i = lookback; i < len - lookback; i++) {
+        // Pivot low: lowest low in window
+        let isLow = true, isHigh = true;
+        for (let j = i - lookback; j <= i + lookback; j++) {
+            if (j === i) continue;
+            if (candles[j].low < candles[i].low) isLow = false;
+            if (candles[j].high > candles[i].high) isHigh = false;
+        }
+        if (isLow) pivotLows.push(i);
+        if (isHigh) pivotHighs.push(i);
+    }
+    
+    // Check last 3 pivot lows for bullish divergence
+    for (let p = 1; p < pivotLows.length && p < 4; p++) {
+        const i1 = pivotLows[p - 1];
+        const i2 = pivotLows[p];
+        if (i2 - i1 < 4) continue; // too close
+        
+        const priceLower = candles[i2].low < candles[i1].low;
+        const rsiHigher = rsiData[i2] > rsiData[i1];
+        const priceHigher = candles[i2].low > candles[i1].low;
+        const rsiLower = rsiData[i2] < rsiData[i1];
+        
+        // Regular bullish: price lower low, RSI higher low
+        if (priceLower && rsiHigher) {
+            divergences.push({ type: 'bullish', hidden: false, i1, i2, price1: candles[i1].low, price2: candles[i2].low, rsi1: rsiData[i1], rsi2: rsiData[i2] });
+        }
+        // Hidden bullish: price higher low, RSI lower low
+        if (priceHigher && rsiLower) {
+            divergences.push({ type: 'bullish', hidden: true, i1, i2, price1: candles[i1].low, price2: candles[i2].low, rsi1: rsiData[i1], rsi2: rsiData[i2] });
+        }
+    }
+    
+    // Check last 3 pivot highs for bearish divergence
+    for (let p = 1; p < pivotHighs.length && p < 4; p++) {
+        const i1 = pivotHighs[p - 1];
+        const i2 = pivotHighs[p];
+        if (i2 - i1 < 4) continue;
+        
+        const priceHigher = candles[i2].high > candles[i1].high;
+        const rsiLower = rsiData[i2] < rsiData[i1];
+        const priceLower = candles[i2].high < candles[i1].high;
+        const rsiHigher = rsiData[i2] > rsiData[i1];
+        
+        // Regular bearish: price higher high, RSI lower high
+        if (priceHigher && rsiLower) {
+            divergences.push({ type: 'bearish', hidden: false, i1, i2, price1: candles[i1].high, price2: candles[i2].high, rsi1: rsiData[i1], rsi2: rsiData[i2] });
+        }
+        // Hidden bearish: price lower high, RSI higher high
+        if (priceLower && rsiHigher) {
+            divergences.push({ type: 'bearish', hidden: true, i1, i2, price1: candles[i1].high, price2: candles[i2].high, rsi1: rsiData[i1], rsi2: rsiData[i2] });
+        }
+    }
+    
+    return divergences;
+}
+
+// Fair Value Gap (FVG) Detection
+// Bullish FVG: candle[i-2].high < candle[i].low — gap up
+// Bearish FVG: candle[i-2].low > candle[i].high — gap down
+function detectFVG(candles) {
+    const gaps = [];
+    if (!candles || candles.length < 3) return gaps;
+    
+    for (let i = 2; i < candles.length; i++) {
+        const c1 = candles[i - 2]; // first candle
+        const c3 = candles[i];     // third candle
+        
+        // Bullish FVG: gap between c1 high and c3 low
+        if (c1.high < c3.low) {
+            gaps.push({
+                type: 'bullish',
+                index: i,
+                top: c3.low,
+                bottom: c1.high,
+                startIdx: i - 2
+            });
+        }
+        // Bearish FVG: gap between c1 low and c3 high  
+        if (c1.low > c3.high) {
+            gaps.push({
+                type: 'bearish',
+                index: i,
+                top: c1.low,
+                bottom: c3.high,
+                startIdx: i - 2
+            });
+        }
+    }
+    return gaps;
+}
+
+function calculateMACD(candles) {
+    const closes = candles.map(c => c.close);
+    const ema12 = calculateEMA(closes, 12);
+    const ema26 = calculateEMA(closes, 26);
+    const macdLine = ema12 - ema26;
+    const signalLine = calculateEMA([...Array(closes.length - 26).fill(0), macdLine], 9);
+    const histogram = macdLine - signalLine;
+    
+    const prevCloses = closes.slice(0, -1);
+    const prevEma12 = calculateEMA(prevCloses, 12);
+    const prevEma26 = calculateEMA(prevCloses, 26);
+    const prevMacdLine = prevEma12 - prevEma26;
+    const prevHistogram = prevMacdLine - calculateEMA([...Array(prevCloses.length - 26).fill(0), prevMacdLine], 9);
+    
+    return {
+        macdLine, signalLine, histogram, prevHistogram,
+        isBullish: histogram > prevHistogram,
+        crossedUp: histogram > 0 && prevHistogram <= 0,
+        crossedDown: histogram < 0 && prevHistogram >= 0
+    };
+}
+
+// Calculate body percentage of candle (body / total range)
+function calculateBodyPercentage(candle) {
+    const range = candle.high - candle.low;
+    if (range === 0) return 0;
+    const body = Math.abs(candle.close - candle.open);
+    return (body / range) * 100;
+}
+
+// Calculate volume ratio compared to average
+function calculateVolumeRatio(candles, period = 20) {
+    if (candles.length < 2) return 1;
+    const latestVol = candles[candles.length - 1].volume;
+    const avgPeriod = Math.min(period, candles.length - 1);
+    const avgVol = candles.slice(-avgPeriod - 1, -1).reduce((sum, c) => sum + c.volume, 0) / avgPeriod;
+    if (avgVol === 0) return 1;
+    return latestVol / avgVol;
+}
+
+function calculateMACDArray(candles) {
+    const closes = candles.map(c => c.close);
+    const result = [];
+    
+    for (let i = 26; i < closes.length; i++) {
+        const slice = closes.slice(0, i + 1);
+        const ema12 = calculateEMA(slice, 12);
+        const ema26 = calculateEMA(slice, 26);
+        result.push({ macdLine: ema12 - ema26, index: i });
+    }
+    
+    const macdValues = result.map(r => r.macdLine);
+    for (let i = 8; i < macdValues.length; i++) {
+        const signal = calculateEMA(macdValues.slice(0, i + 1), 9);
+        result[i].signal = signal;
+        result[i].histogram = macdValues[i] - signal;
+    }
+    
+    return result.filter(r => r.histogram !== undefined);
+}
+
+function calculateEMA(data, period) {
+    if (data.length < period) return data[data.length - 1] || 0;
+    const multiplier = 2 / (period + 1);
+    let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    for (let i = period; i < data.length; i++) {
+        ema = (data[i] - ema) * multiplier + ema;
+    }
+    return ema;
+}
+
+// ============================================
+// SUPPORT & RESISTANCE DETECTION
+// ============================================
+
+function calculateSupportResistance(candles, maxLevels = 5) {
+    if (!candles || candles.length < 20) return { support: [], resistance: [] };
+    
+    const pivots = [];
+    const lookback = 5; // candles left/right to confirm pivot
+    
+    // Find pivot highs and lows
+    for (let i = lookback; i < candles.length - lookback; i++) {
+        let isPivotHigh = true, isPivotLow = true;
+        
+        for (let j = 1; j <= lookback; j++) {
+            if (candles[i].high <= candles[i - j].high || candles[i].high <= candles[i + j].high) {
+                isPivotHigh = false;
+            }
+            if (candles[i].low >= candles[i - j].low || candles[i].low >= candles[i + j].low) {
+                isPivotLow = false;
+            }
+        }
+        
+        if (isPivotHigh) pivots.push({ price: candles[i].high, type: 'resistance', idx: i, strength: 1 });
+        if (isPivotLow) pivots.push({ price: candles[i].low, type: 'support', idx: i, strength: 1 });
+    }
+    
+    if (pivots.length === 0) return { support: [], resistance: [] };
+    
+    // Cluster nearby levels (within 0.3% of each other)
+    const currentPrice = candles[candles.length - 1].close;
+    const clusterThreshold = currentPrice * 0.003;
+    
+    const clusters = [];
+    const used = new Set();
+    
+    pivots.sort((a, b) => a.price - b.price);
+    
+    for (let i = 0; i < pivots.length; i++) {
+        if (used.has(i)) continue;
+        
+        let sumPrice = pivots[i].price;
+        let count = 1;
+        let maxIdx = pivots[i].idx;
+        const type = pivots[i].type;
+        used.add(i);
+        
+        for (let j = i + 1; j < pivots.length; j++) {
+            if (used.has(j)) continue;
+            if (Math.abs(pivots[j].price - pivots[i].price) <= clusterThreshold) {
+                sumPrice += pivots[j].price;
+                count++;
+                maxIdx = Math.max(maxIdx, pivots[j].idx);
+                used.add(j);
+            }
+        }
+        
+        clusters.push({
+            price: sumPrice / count,
+            touches: count,
+            type: sumPrice / count > currentPrice ? 'resistance' : 'support',
+            recency: maxIdx / candles.length, // 0-1, higher = more recent
+            strength: count + (maxIdx / candles.length) * 2 // touches + recency bonus
+        });
+    }
+    
+    // Sort by strength, take top levels
+    clusters.sort((a, b) => b.strength - a.strength);
+    
+    const support = clusters.filter(c => c.type === 'support').slice(0, maxLevels);
+    const resistance = clusters.filter(c => c.type === 'resistance').slice(0, maxLevels);
+    
+    return { support, resistance };
+}
+
+// ============================================
+// CONFLUENCE CALCULATION
+// ============================================
+
+// Signal state for cooldown
+state.signalState = state.signalState || { current: 'NEUTRAL', lastChange: 0, cooldownMs: 60000 };
+
+function calculateConfluence() {
+    const enabledTFs = state.timeframes.filter(tf => tf.enabled);
+    const weights = WEIGHT_METHODS[state.settings.weightMethod] || WEIGHT_METHODS.linear;
+    const tfDetails = [];
+    
+    let totalBullWeight = 0, totalBearWeight = 0;
+    let bullCount = 0, bearCount = 0;
+    let alignedTFs = 0;
+    
+    enabledTFs.forEach(tf => {
+        const data = state.data[tf.id];
+        if (!data) return;
+        
+        let baseWeight = weights[tf.id] || 1;
+        let modifiers = [];
+        let finalWeight = baseWeight;
+        
+        // ── ENHANCED DIRECTION SCORE ──
+        // Instead of just candle color, we score [-1 to +1] using 4 factors:
+        
+        let directionScore = 0;
+        let dirComponents = [];
+        
+        // 1. Candle direction: +0.25 or -0.25
+        directionScore += data.isBullish ? 0.25 : -0.25;
+        dirComponents.push(data.isBullish ? 'Candle↑' : 'Candle↓');
+        
+        // 2. Close position in range: maps [0,1] to [-0.25, +0.25]
+        const closePos = data.buyPct / 100; // 0-1
+        directionScore += (closePos - 0.5) * 0.5; // -0.25 to +0.25
+        dirComponents.push(closePos >= 0.5 ? `Close${(closePos*100).toFixed(0)}%↑` : `Close${(closePos*100).toFixed(0)}%↓`);
+        
+        // 3. Price vs EMA21: +0.25 or -0.25
+        if (data.trend) {
+            directionScore += data.trend.priceAboveEma21 ? 0.25 : -0.25;
+            dirComponents.push(data.trend.priceAboveEma21 ? 'Price>EMA21' : 'Price<EMA21');
+            
+            // 4. EMA21 vs EMA50 (trend alignment): +0.25 or -0.25
+            directionScore += data.trend.ema21AboveEma50 ? 0.25 : -0.25;
+            dirComponents.push(data.trend.ema21AboveEma50 ? 'EMA21>50' : 'EMA21<50');
+        }
+        
+        // ── MOMENTUM SCORE ──
+        let momentumScore = 0;
+        
+        if (state.settings.useIndicatorMod && data.rsi && data.macd) {
+            // RSI zone: maps to [-0.5, +0.5]
+            if (data.rsi > 60) momentumScore += 0.5;
+            else if (data.rsi < 40) momentumScore -= 0.5;
+            else momentumScore += (data.rsi - 50) / 20; // gradual
+            
+            // RSI direction
+            if (data.trend && data.trend.rsiRising) momentumScore += 0.15;
+            else momentumScore -= 0.15;
+            
+            // MACD histogram: positive & rising = strong bull
+            if (data.macd.histogram > 0) momentumScore += 0.25;
+            else momentumScore -= 0.25;
+            
+            // MACD crossover events (extra weight)
+            if (data.macd.crossedUp) momentumScore += 0.3;
+            else if (data.macd.crossedDown) momentumScore -= 0.3;
+            
+            // Clamp to [-1, 1]
+            momentumScore = Math.max(-1, Math.min(1, momentumScore));
+        }
+        
+        // ── COMBINED TF SCORE [-1 to +1] ──
+        const hasIndicators = state.settings.useIndicatorMod && data.rsi && data.macd;
+        const tfScore = hasIndicators 
+            ? (directionScore * 0.6 + momentumScore * 0.4)  // 60% trend, 40% momentum
+            : directionScore;  // trend only
+        
+        // ── MODIFIERS (multiply weight) ──
+        if (state.settings.useStrengthMod) {
+            if (data.bodyPct >= BODY_CONFIG.strongThreshold) {
+                finalWeight *= 1.3;
+                modifiers.push('StrongBody ×1.3');
+            } else if (data.bodyPct < BODY_CONFIG.weakThreshold) {
+                finalWeight *= 0.6;
+                modifiers.push('WeakBody ×0.6');
+            }
+        }
+        
+        if (state.settings.useVolumeMod) {
+            if (data.volumeRatio >= VOLUME_CONFIG.spikeThreshold) {
+                finalWeight *= 1.4;
+                modifiers.push('VolSpike ×1.4');
+            } else if (data.volumeRatio >= VOLUME_CONFIG.highThreshold) {
+                finalWeight *= 1.2;
+                modifiers.push('HighVol ×1.2');
+            } else if (data.volumeRatio <= VOLUME_CONFIG.lowThreshold) {
+                finalWeight *= 0.7;
+                modifiers.push('LowVol ×0.7');
+            }
+        }
+        
+        // ── ACCUMULATE ──
+        const isBullTF = tfScore > 0;
+        const weightedScore = Math.abs(tfScore) * finalWeight;
+        
+        if (isBullTF) {
+            totalBullWeight += weightedScore;
+            bullCount++;
+        } else {
+            totalBearWeight += weightedScore;
+            bearCount++;
+        }
+        
+        // Track alignment (all TFs same direction = stronger signal)
+        if (Math.abs(tfScore) > 0.3) alignedTFs++;
+        
+        tfDetails.push({
+            tf: tf.label,
+            base: baseWeight,
+            final: finalWeight.toFixed(2),
+            mods: modifiers.join(' '),
+            dir: isBullTF ? '🟢' : '🔴',
+            score: tfScore.toFixed(2),
+            components: dirComponents.join(' ')
+        });
+    });
+    
+    const totalScore = totalBullWeight + totalBearWeight;
+    const confluencePct = totalScore > 0 ? (totalBullWeight / totalScore) * 100 : 50;
+    
+    // Store in state for chart markers
+    state.confluenceScore = confluencePct;
+    
+    // ── SIGNAL GENERATION ──
+    const signal = generateSignal(confluencePct, bullCount, bearCount, alignedTFs, enabledTFs.length);
+    
+    // Track high confluence moments
+    trackConfluenceHistory(confluencePct, bullCount > bearCount ? 'BULL' : 'BEAR');
+    
+    updateConfluenceDisplay(confluencePct, bullCount, bearCount, tfDetails, signal);
+}
+
+// ── BUY/SELL SIGNAL GENERATOR ──
+function generateSignal(pct, bullCount, bearCount, alignedTFs, totalTFs) {
+    const now = Date.now();
+    const ss = state.signalState;
+    
+    // Determine raw signal tier
+    let rawSignal, signalClass;
+    if (pct >= 80 && alignedTFs >= Math.min(3, totalTFs)) {
+        rawSignal = 'STRONG BUY';
+        signalClass = 'signal-strong-buy';
+    } else if (pct >= 65) {
+        rawSignal = 'BUY';
+        signalClass = 'signal-buy';
+    } else if (pct <= 20 && alignedTFs >= Math.min(3, totalTFs)) {
+        rawSignal = 'STRONG SELL';
+        signalClass = 'signal-strong-sell';
+    } else if (pct <= 35) {
+        rawSignal = 'SELL';
+        signalClass = 'signal-sell';
+    } else {
+        rawSignal = 'NEUTRAL';
+        signalClass = 'signal-neutral';
+    }
+    
+    // Cooldown: don't flip signal too fast (60s minimum between changes)
+    const isNewSignal = rawSignal !== ss.current;
+    const cooldownPassed = (now - ss.lastChange) >= ss.cooldownMs;
+    
+    if (isNewSignal && cooldownPassed) {
+        ss.current = rawSignal;
+        ss.lastChange = now;
+        // Fire notifications
+        notifySignalChange(rawSignal);
+        return { signal: rawSignal, signalClass, isNew: true };
+    } else if (isNewSignal && !cooldownPassed) {
+        // In cooldown - show pending
+        return { signal: ss.current, signalClass: getSignalClass(ss.current), isNew: false, pending: rawSignal };
+    }
+    
+    return { signal: ss.current, signalClass: getSignalClass(ss.current), isNew: false };
+}
+
+function getSignalClass(signal) {
+    const map = {
+        'STRONG BUY': 'signal-strong-buy',
+        'BUY': 'signal-buy',
+        'NEUTRAL': 'signal-neutral',
+        'SELL': 'signal-sell',
+        'STRONG SELL': 'signal-strong-sell'
+    };
+    return map[signal] || 'signal-neutral';
+}
+
+// ============================================
+// SIGNAL NOTIFICATIONS
+// ============================================
+
+function notifySignalChange(signal) {
+    const coin = state.currentCoin?.shortName || 'Coin';
+    
+    // Sound notification
+    if (state.settings.enableSignalSound !== false) {
+        playSignalSound(signal);
+    }
+    
+    // Popup notification
+    if (state.settings.enableSignalPopup !== false) {
+        showSignalPopup(coin, signal);
+    }
+}
+
+function playSignalSound(signal) {
+    try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        
+        gain.gain.value = 0.15;
+        
+        if (signal.includes('BUY')) {
+            // Rising tone for buy
+            osc.frequency.setValueAtTime(440, ctx.currentTime);
+            osc.frequency.linearRampToValueAtTime(660, ctx.currentTime + 0.15);
+            if (signal.includes('STRONG')) {
+                osc.frequency.linearRampToValueAtTime(880, ctx.currentTime + 0.3);
+            }
+        } else if (signal.includes('SELL')) {
+            // Falling tone for sell
+            osc.frequency.setValueAtTime(660, ctx.currentTime);
+            osc.frequency.linearRampToValueAtTime(440, ctx.currentTime + 0.15);
+            if (signal.includes('STRONG')) {
+                osc.frequency.linearRampToValueAtTime(330, ctx.currentTime + 0.3);
+            }
+        } else {
+            // Short blip for neutral
+            osc.frequency.value = 520;
+        }
+        
+        const duration = signal.includes('STRONG') ? 0.35 : 0.2;
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + duration);
+    } catch (e) { /* silent fail */ }
+}
+
+function showSignalPopup(coin, signal) {
+    // Remove existing popup
+    const existing = document.getElementById('signalPopup');
+    if (existing) existing.remove();
+    
+    const popup = document.createElement('div');
+    popup.id = 'signalPopup';
+    popup.className = `signal-popup ${getSignalClass(signal)}`;
+    
+    const icon = signal.includes('BUY') ? '📈' : signal.includes('SELL') ? '📉' : '➡️';
+    popup.innerHTML = `
+        <div class="signal-popup-icon">${icon}</div>
+        <div class="signal-popup-text">
+            <strong>${coin}</strong>
+            <span>${signal}</span>
+        </div>
+        <button class="signal-popup-close" onclick="this.parentElement.remove()">✕</button>
+    `;
+    
+    document.body.appendChild(popup);
+    
+    // Auto dismiss after 5s
+    setTimeout(() => popup.remove(), 5000);
+}
+
+// ============================================
+// INTERACTIVE CHART DRAWING
+// ============================================
+
+function initChartState(tfId) {
+    if (!state.chartStates[tfId]) {
+        state.chartStates[tfId] = { panX: 0, zoom: 1, isDragging: false, lastX: 0 };
+    }
+    return state.chartStates[tfId];
+}
+
+function drawInteractiveChart(canvasId, data, tfId, opts = {}) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !data || !data.candles || data.candles.length === 0) return;
+    
+    // Store opts on canvas for re-draws from interaction handlers
+    canvas._chartOpts = opts;
+    
+    const ctx = canvas.getContext('2d');
+    const container = canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    
+    const chartState = initChartState(tfId);
+    const zoom = chartState.zoom * state.globalZoom;
+    const panX = chartState.panX;
+    
+    // Calculate visible candles based on zoom
+    const baseVisibleCandles = 50;
+    const visibleCandles = Math.max(20, Math.floor(baseVisibleCandles / zoom));
+    
+    const showRSI = state.settings.showChartRSI;
+    const showMACD = state.settings.showChartMACD;
+    const showVolume = state.settings.showChartVolume !== false;
+    const showPatterns = state.settings.showPatterns !== false;
+    const showMA = state.settings.showChartMA;
+    const showEMA = state.settings.showChartEMA;
+    const showVWAP = state.settings.showChartVWAP;
+    const showSR = state.settings.showChartSR;
+    const coinDecimals = opts.decimals || state.currentCoin?.decimals || 2;
+    
+    // Fixed sub-panel heights (pixels) — price chart never shrinks
+    const SUB_VOL_H = 46;
+    const SUB_RSI_H = 52;
+    const SUB_MACD_H = 52;
+    
+    let volumeHeight = showVolume ? SUB_VOL_H : 0;
+    let rsiHeight = showRSI ? SUB_RSI_H : 0;
+    let macdHeight = showMACD ? SUB_MACD_H : 0;
+    const subTotal = volumeHeight + rsiHeight + macdHeight;
+    
+    // Canvas grows: base 154px for price chart (+10%) + sub-panels added below
+    const baseH = 154;
+    const totalH = baseH + subTotal;
+    canvas.style.height = totalH + 'px';
+    
+    // HiDPI support — measure after setting height
+    const rect = container.getBoundingClientRect();
+    const canvasW = rect.width || 300;
+    canvas.style.width = canvasW + 'px';
+    canvas.width = canvasW * dpr;
+    canvas.height = totalH * dpr;
+    ctx.scale(dpr, dpr);
+    
+    let width = canvasW;
+    let height = totalH;
+    
+    const padding = { top: 20, right: 55, bottom: 5, left: 5 };
+    let mainChartHeight = height - padding.top - padding.bottom - subTotal;
+    
+    const chartWidth = width - padding.left - padding.right;
+    
+    // Calculate visible range with pan
+    const totalCandles = data.candles.length;
+    const maxPan = Math.max(0, totalCandles - visibleCandles);
+    const startIdx = Math.max(0, Math.min(maxPan, totalCandles - visibleCandles + Math.floor(panX)));
+    const endIdx = Math.min(totalCandles, startIdx + visibleCandles);
+    const displayCandles = data.candles.slice(startIdx, endIdx);
+    
+    if (displayCandles.length === 0) return;
+    
+    const prices = displayCandles.flatMap(c => [c.high, c.low]);
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const priceRange = maxPrice - minPrice || 1;
+    
+    const scaleY = (price) => padding.top + mainChartHeight - ((price - minPrice) / priceRange) * mainChartHeight;
+    
+    const candleWidth = Math.max(2, (chartWidth / displayCandles.length) * 0.7);
+    const candleSpacing = chartWidth / displayCandles.length;
+    
+    // Theme-aware colors
+    const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const isDark = theme === 'dark';
+    const isLightColorful = theme === 'colorful';
+    
+    let bgColor, bullColor, bearColor, gridColor, textColor, maColor, emaColor, vwapColor;
+    
+    if (isDark) {
+        bgColor = '#1e1e42';
+        bullColor = '#34d399';
+        bearColor = '#fb7185';
+        gridColor = '#2e2e52';
+        textColor = '#b8b8d0';
+        maColor = '#60a5fa';
+        emaColor = '#fbbf24';
+        vwapColor = '#c084fc';
+    } else if (isLightColorful) {
+        bgColor = '#faf5ff';
+        bullColor = '#059669';
+        bearColor = '#e11d48';
+        gridColor = '#ddd6fe';
+        textColor = '#4338ca';
+        maColor = '#2563eb';
+        emaColor = '#ea580c';
+        vwapColor = '#d946ef';
+    } else {
+        // light-simple
+        bgColor = '#f8f9fa';
+        bullColor = '#16a34a';
+        bearColor = '#dc2626';
+        gridColor = '#e5e7eb';
+        textColor = '#4a4a5a';
+        maColor = '#3b82f6';
+        emaColor = '#f59e0b';
+        vwapColor = '#a855f7';
+    }
+    
+    const neutralColor = '#f59e0b';
+    
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, width, height);
+    
+    // Main price chart border
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(padding.left, padding.top, chartWidth, mainChartHeight);
+    
+    // Draw price scale on right side (always visible)
+    {
+        const decimals = coinDecimals;
+        const scaleX = width - padding.right + 3;
+        const numTicks = Math.min(6, Math.max(3, Math.floor(mainChartHeight / 30)));
+        
+        ctx.font = '8px JetBrains Mono, monospace';
+        ctx.textAlign = 'left';
+        
+        // Separator line
+        ctx.strokeStyle = gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(width - padding.right, padding.top);
+        ctx.lineTo(width - padding.right, padding.top + mainChartHeight);
+        ctx.stroke();
+        
+        for (let i = 0; i <= numTicks; i++) {
+            const ratio = i / numTicks;
+            const price = maxPrice - ratio * priceRange;
+            const y = padding.top + ratio * mainChartHeight;
+            
+            // Grid line
+            ctx.strokeStyle = gridColor;
+            ctx.globalAlpha = 0.3;
+            ctx.beginPath();
+            ctx.moveTo(padding.left, y);
+            ctx.lineTo(width - padding.right, y);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+            
+            // Tick mark
+            ctx.strokeStyle = textColor;
+            ctx.beginPath();
+            ctx.moveTo(width - padding.right, y);
+            ctx.lineTo(width - padding.right + 3, y);
+            ctx.stroke();
+            
+            // Price label
+            ctx.fillStyle = textColor;
+            ctx.fillText(price.toFixed(decimals), scaleX + 2, y + 3);
+        }
+        
+        // Current price indicator on the scale
+        const lastCandle = displayCandles[displayCandles.length - 1];
+        if (lastCandle) {
+            const curY = scaleY(lastCandle.close);
+            const isBull = lastCandle.close >= lastCandle.open;
+            const curColor = isBull ? bullColor : bearColor;
+            
+            // Price tag background
+            ctx.fillStyle = curColor;
+            const priceText = lastCandle.close.toFixed(decimals);
+            const tagW = ctx.measureText(priceText).width + 8;
+            ctx.fillRect(width - padding.right, curY - 6, padding.right, 12);
+            
+            // Arrow
+            ctx.beginPath();
+            ctx.moveTo(width - padding.right, curY - 5);
+            ctx.lineTo(width - padding.right - 4, curY);
+            ctx.lineTo(width - padding.right, curY + 5);
+            ctx.fill();
+            
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 8px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(priceText, width - padding.right + 3, curY + 3);
+        }
+    }
+    
+    // Clear pattern data for tooltip
+    canvas.patternData = [];
+    
+    // Find which candle has the highest high and lowest low
+    let maxPriceIdx = 0, minPriceIdx = 0;
+    displayCandles.forEach((c, idx) => {
+        if (c.high === maxPrice) maxPriceIdx = idx;
+        if (c.low === minPrice) minPriceIdx = idx;
+    });
+    
+    // Calculate X positions for high/low labels (will draw after candles)
+    
+    // Get patterns for visible range and filter by user settings
+    const tfPatterns = state.patterns[tfId] || [];
+    const patternSettings = state.settings.patterns || {};
+    
+    // Map pattern names to settings keys
+    const patternNameToKey = {
+        'Doji': 'doji',
+        'Hammer': 'hammer',
+        'Inv Hammer': 'invHammer',
+        'Hanging Man': 'hangingMan',
+        'Shoot Star': 'shootStar',
+        'Marubozu': 'marubozu',
+        'Spin Top': 'spinTop',
+        'Bull Engulf': 'bullEngulf',
+        'Bear Engulf': 'bearEngulf',
+        'Bull Harami': 'bullHarami',
+        'Bear Harami': 'bearHarami',
+        'Piercing': 'piercing',
+        'Dark Cloud': 'darkCloud',
+        'Tweez Top': 'tweezTop',
+        'Tweez Bot': 'tweezBot',
+        'Morning ⭐': 'morningStar',
+        'Evening ⭐': 'eveningStar',
+        '3 Soldiers': 'threeSoldiers',
+        '3 Crows': 'threeCrows'
+    };
+    
+    const visiblePatterns = tfPatterns.filter(p => {
+        if (p.index < startIdx || p.index >= endIdx) return false;
+        const key = patternNameToKey[p.name];
+        return key ? (patternSettings[key] !== false) : true;
+    });
+    
+    // Get MA/EMA line configs from settings
+    const maLines = state.settings.maLines || [20];
+    const emaLines = state.settings.emaLines || [21];
+    
+    // MA colors from settings (user-customizable)
+    const defaultMaColorsPalette = ['#3b82f6', '#06b6d4', '#0ea5e9', '#14b8a6'];
+    const maColors = state.settings.maColors || defaultMaColorsPalette;
+    // EMA colors from settings (user-customizable)
+    const defaultEmaColorsPalette = ['#f59e0b', '#f97316', '#ef4444', '#ec4899'];
+    const emaColors = state.settings.emaColors || defaultEmaColorsPalette;
+    
+    // Calculate and draw MA lines
+    if (showMA && data.candles.length > 0) {
+        const allCandles = data.candles;
+        maLines.forEach((period, lineIdx) => {
+            if (allCandles.length >= period) {
+                const maData = [];
+                for (let i = startIdx; i < endIdx; i++) {
+                    if (i >= period - 1) {
+                        let sum = 0;
+                        for (let j = i - period + 1; j <= i; j++) {
+                            sum += allCandles[j].close;
+                        }
+                        maData.push(sum / period);
+                    } else {
+                        maData.push(null);
+                    }
+                }
+                
+                // Draw this MA line
+                if (maData.length > 0) {
+                    ctx.strokeStyle = maColors[lineIdx % maColors.length];
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    let started = false;
+                    maData.forEach((val, i) => {
+                        if (val !== null) {
+                            const x = padding.left + i * candleSpacing + candleSpacing / 2;
+                            const y = scaleY(val);
+                            if (!started) { ctx.moveTo(x, y); started = true; }
+                            else ctx.lineTo(x, y);
+                        }
+                    });
+                    ctx.stroke();
+                }
+            }
+        });
+    }
+    
+    // Calculate and draw EMA lines
+    if (showEMA && data.candles.length > 0) {
+        const allCandles = data.candles;
+        emaLines.forEach((period, lineIdx) => {
+            if (allCandles.length >= period) {
+                const mult = 2 / (period + 1);
+                let ema = allCandles[0].close;
+                const fullEma = [];
+                for (let i = 0; i < allCandles.length; i++) {
+                    ema = (allCandles[i].close - ema) * mult + ema;
+                    fullEma.push(ema);
+                }
+                const emaData = fullEma.slice(startIdx, endIdx);
+                
+                // Draw this EMA line
+                if (emaData.length > 0) {
+                    ctx.strokeStyle = emaColors[lineIdx % emaColors.length];
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    emaData.forEach((val, i) => {
+                        const x = padding.left + i * candleSpacing + candleSpacing / 2;
+                        const y = scaleY(val);
+                        if (i === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    });
+                    ctx.stroke();
+                }
+            }
+        });
+    }
+    
+    // VWAP
+    if (showVWAP && data.candles.length > 0) {
+        const allCandles = data.candles;
+        let cumVolPrice = 0, cumVol = 0;
+        const fullVwap = [];
+        for (let i = 0; i < allCandles.length; i++) {
+            const typical = (allCandles[i].high + allCandles[i].low + allCandles[i].close) / 3;
+            cumVolPrice += typical * allCandles[i].volume;
+            cumVol += allCandles[i].volume;
+            fullVwap.push(cumVol > 0 ? cumVolPrice / cumVol : typical);
+        }
+        const vwapData = fullVwap.slice(startIdx, endIdx);
+        
+        if (vwapData.length > 0) {
+            ctx.strokeStyle = vwapColor;
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 2]);
+            ctx.beginPath();
+            vwapData.forEach((val, i) => {
+                const x = padding.left + i * candleSpacing + candleSpacing / 2;
+                const y = scaleY(val);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+    }
+    
+    // Support & Resistance levels
+    if (showSR && data.candles.length >= 20) {
+        const sr = calculateSupportResistance(data.candles);
+        const supCol = state.settings.srSupportColor || '#22c55e';
+        const resCol = state.settings.srResistanceColor || '#ef4444';
+        const srColor = { support: supCol + '99', resistance: resCol + '99' };
+        const srBg = { support: supCol + '14', resistance: resCol + '14' };
+        
+        [...sr.support, ...sr.resistance].forEach(level => {
+            const y = scaleY(level.price);
+            if (y < padding.top || y > padding.top + mainChartHeight) return; // off-screen
+            
+            const color = srColor[level.type];
+            const bg = srBg[level.type];
+            
+            // Draw zone band (subtle fill)
+            ctx.fillStyle = bg;
+            ctx.fillRect(padding.left, y - 2, chartWidth, 4);
+            
+            // Draw dashed line
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(padding.left, y);
+            ctx.lineTo(padding.left + chartWidth, y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            // Label
+            ctx.font = 'bold 7px JetBrains Mono, monospace';
+            ctx.fillStyle = color;
+            ctx.textAlign = 'left';
+            const label = level.type === 'support' ? `S` : `R`;
+            const touchLabel = level.touches > 1 ? `${label}×${level.touches}` : label;
+            ctx.fillText(touchLabel, padding.left + 2, y - 3);
+        });
+    }
+    
+    // Draw candles with H/L labels
+    // Store candle positions for click detection
+    canvas.candleData = [];
+    
+    // Draw hovered candle highlight column (behind candles)
+    if (typeof canvas.hoveredCandleIdx === 'number' && canvas.hoveredCandleIdx >= 0 && canvas.hoveredCandleIdx < displayCandles.length) {
+        const hx = padding.left + canvas.hoveredCandleIdx * candleSpacing;
+        ctx.fillStyle = isDark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.10)';
+        ctx.fillRect(hx, padding.top, candleSpacing, mainChartHeight + volumeHeight);
+        
+        // Crosshair horizontal line at current price
+        const hCandle = displayCandles[canvas.hoveredCandleIdx];
+        if (hCandle) {
+            const crossY = scaleY(hCandle.close);
+            ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.2)' : 'rgba(0,0,0,0.15)';
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(padding.left, crossY);
+            ctx.lineTo(width - padding.right, crossY);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            // Show highlighted price on the scale
+            {
+                const decimals = coinDecimals;
+                const priceText = hCandle.close.toFixed(decimals);
+                const tagW = ctx.measureText(priceText).width + 8;
+                ctx.fillStyle = isDark ? 'rgba(100,116,139,0.9)' : 'rgba(71,85,105,0.9)';
+                ctx.fillRect(width - padding.right, crossY - 6, padding.right, 12);
+                ctx.fillStyle = '#fff';
+                ctx.font = '8px JetBrains Mono, monospace';
+                ctx.textAlign = 'left';
+                ctx.fillText(priceText, width - padding.right + 3, crossY + 3);
+            }
+        }
+    }
+    
+    displayCandles.forEach((candle, i) => {
+        const x = padding.left + i * candleSpacing + candleSpacing / 2;
+        const isBull = candle.close >= candle.open;
+        const openY = scaleY(candle.open);
+        const closeY = scaleY(candle.close);
+        const highY = scaleY(candle.high);
+        const lowY = scaleY(candle.low);
+        
+        // Calculate candle metrics
+        const range = candle.high - candle.low;
+        const bodySize = Math.abs(candle.close - candle.open);
+        const bodyPct = range > 0 ? (bodySize / range * 100) : 0;
+        const upperWick = candle.high - Math.max(candle.open, candle.close);
+        const lowerWick = Math.min(candle.open, candle.close) - candle.low;
+        const upperWickPct = range > 0 ? (upperWick / range * 100) : 0;
+        const lowerWickPct = range > 0 ? (lowerWick / range * 100) : 0;
+        const closePosition = range > 0 ? (candle.close - candle.low) / range : 0.5;
+        const buyPct = closePosition * 100;
+        const sellPct = (1 - closePosition) * 100;
+        
+        // Store candle data for click detection
+        canvas.candleData.push({
+            x: x - candleWidth / 2,
+            y: highY,
+            width: candleWidth,
+            height: lowY - highY,
+            candle: candle,
+            isBull: isBull,
+            bodyPct: bodyPct,
+            upperWickPct: upperWickPct,
+            lowerWickPct: lowerWickPct,
+            buyPct: buyPct,
+            sellPct: sellPct
+        });
+        
+        // Wick
+        ctx.strokeStyle = isBull ? bullColor : bearColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, highY);
+        ctx.lineTo(x, lowY);
+        ctx.stroke();
+        
+        // Body
+        ctx.fillStyle = isBull ? bullColor : bearColor;
+        const bodyTop = Math.min(openY, closeY);
+        const bodyHeight = Math.max(1, Math.abs(closeY - openY));
+        ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+    });
+    
+    // Draw pattern labels FIRST (so price labels appear on top) - INITIALS only, 35% opacity
+    // Hide patterns when zoomed out too far (more than 50 candles visible)
+    const showPatternsNow = showPatterns && displayCandles.length <= 50;
+    
+    if (showPatternsNow) {
+        ctx.font = 'bold 8px Inter, sans-serif';
+        ctx.textAlign = 'center';
+        
+        visiblePatterns.forEach(p => {
+            const displayIdx = p.index - startIdx;
+            if (displayIdx < 0 || displayIdx >= displayCandles.length) return;
+            
+            const candle = displayCandles[displayIdx];
+            const x = padding.left + displayIdx * candleSpacing + candleSpacing / 2;
+            const y = scaleY(candle.low) + 10; // Below the candle
+            
+            // Get initials from pattern name (e.g., "Bull Harami" -> "BH", "Tweez Top" -> "TT")
+            const initials = p.name.split(' ').map(word => word.charAt(0).toUpperCase()).join('');
+            
+            // Background - 35% opacity
+            const labelWidth = ctx.measureText(initials).width + 4;
+            let labelColor;
+            if (p.type === 'bullish') labelColor = 'rgba(16, 185, 129, 0.35)';
+            else if (p.type === 'bearish') labelColor = 'rgba(239, 68, 68, 0.35)';
+            else labelColor = 'rgba(245, 158, 11, 0.35)';
+            
+            ctx.fillStyle = labelColor;
+            ctx.fillRect(x - labelWidth / 2, y - 7, labelWidth, 10);
+            
+            // Text - initials with 50% opacity for readability
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+            ctx.fillText(initials, x, y);
+            
+            // Store pattern info for tooltip (attach to canvas data)
+            if (!canvas.patternData) canvas.patternData = [];
+            canvas.patternData.push({
+                x: x - labelWidth / 2,
+                y: y - 7,
+                width: labelWidth,
+                height: 10,
+                name: p.name,
+                type: p.type
+            });
+        });
+    }
+    
+    // Draw High/Low price labels at actual candle positions (like Binance)
+    const hlDecimals = coinDecimals;
+    ctx.font = 'bold 8px JetBrains Mono, monospace';
+    
+    // HIGH label - positioned at the highest candle
+    const highCandleX = padding.left + maxPriceIdx * candleSpacing + candleSpacing / 2;
+    const highCandleY = scaleY(maxPrice);
+    const highText = `← ${maxPrice.toFixed(hlDecimals)}`;
+    const highTextW = ctx.measureText(highText).width + 6;
+    
+    // Decide label side: if candle is in right half, put label on left
+    const highOnRight = highCandleX < (width - padding.right) / 2;
+    const highLabelX = highOnRight ? highCandleX + candleSpacing * 0.6 : highCandleX - highTextW - candleSpacing * 0.3;
+    const highLabelText = highOnRight ? `← ${maxPrice.toFixed(hlDecimals)}` : `${maxPrice.toFixed(hlDecimals)} →`;
+    const highLW = ctx.measureText(highLabelText).width + 8;
+    const highLX = highOnRight ? highCandleX + candleSpacing * 0.6 : highCandleX - highLW - candleSpacing * 0.3;
+    
+    // Dashed line from candle to label
+    ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+    ctx.lineWidth = 0.8;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(highCandleX, highCandleY);
+    ctx.lineTo(highOnRight ? highLX : highLX + highLW, highCandleY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    // High badge at candle position
+    ctx.fillStyle = 'rgba(16, 185, 129, 0.9)';
+    ctx.fillRect(highLX, highCandleY - 6, highLW, 13);
+    ctx.fillStyle = 'white';
+    ctx.textAlign = 'left';
+    ctx.fillText(highLabelText, highLX + 4, highCandleY + 4);
+    
+    // LOW label - positioned at the lowest candle
+    const lowCandleX = padding.left + minPriceIdx * candleSpacing + candleSpacing / 2;
+    const lowCandleY = scaleY(minPrice);
+    const lowOnRight = lowCandleX < (width - padding.right) / 2;
+    const lowLabelText = lowOnRight ? `← ${minPrice.toFixed(hlDecimals)}` : `${minPrice.toFixed(hlDecimals)} →`;
+    const lowLW = ctx.measureText(lowLabelText).width + 8;
+    const lowLX = lowOnRight ? lowCandleX + candleSpacing * 0.6 : lowCandleX - lowLW - candleSpacing * 0.3;
+    
+    // Dashed line from candle to label
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+    ctx.lineWidth = 0.8;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(lowCandleX, lowCandleY);
+    ctx.lineTo(lowOnRight ? lowLX : lowLX + lowLW, lowCandleY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    // Low badge at candle position
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.9)';
+    ctx.fillRect(lowLX, lowCandleY - 6, lowLW, 13);
+    ctx.fillStyle = 'white';
+    ctx.textAlign = 'left';
+    ctx.fillText(lowLabelText, lowLX + 4, lowCandleY + 4);
+    
+    // Volume bars - supports regular or buy/sell split
+    if (showVolume) {
+        const volTop = padding.top + mainChartHeight + 2;
+        const volumes = displayCandles.map(c => c.volume);
+        const maxVol = Math.max(...volumes);
+        const volumeType = state.settings.volumeType || 'buysell';
+        
+        // Panel border
+        ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(padding.left, volTop, chartWidth, volumeHeight - 2);
+        
+        displayCandles.forEach((candle, i) => {
+            const x = padding.left + i * candleSpacing + candleSpacing / 2;
+            const totalVolHeight = (candle.volume / maxVol) * (volumeHeight - 4);
+            const isBull = candle.close >= candle.open;
+            
+            if (volumeType === 'regular') {
+                ctx.fillStyle = (isBull ? bullColor : bearColor) + 'AA';
+                ctx.fillRect(x - candleWidth / 2, volTop + volumeHeight - 2 - totalVolHeight, candleWidth, totalVolHeight);
+            } else {
+                const range = candle.high - candle.low;
+                const closePosition = range > 0 ? (candle.close - candle.low) / range : 0.5;
+                const buyPct = closePosition;
+                const sellPct = 1 - closePosition;
+                const buyHeight = totalVolHeight * buyPct;
+                const sellHeight = totalVolHeight * sellPct;
+                
+                ctx.fillStyle = bearColor + 'AA';
+                ctx.fillRect(x - candleWidth / 2, volTop + volumeHeight - 2 - sellHeight, candleWidth, sellHeight);
+                ctx.fillStyle = bullColor + 'AA';
+                ctx.fillRect(x - candleWidth / 2, volTop + volumeHeight - 2 - sellHeight - buyHeight, candleWidth, buyHeight);
+            }
+        });
+        
+        // Volume label with current value
+        const lastCandle = displayCandles[displayCandles.length - 1];
+        const volRatio = data.volumeRatio || 0;
+        const fmtVol = (v) => v >= 1e9 ? (v/1e9).toFixed(1)+'B' : v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(1)+'K' : v.toFixed(0);
+        
+        ctx.font = 'bold 8px JetBrains Mono, monospace';
+        ctx.textAlign = 'left';
+        
+        if (volumeType === 'regular') {
+            ctx.fillStyle = textColor;
+            ctx.fillText(`VOL ${fmtVol(lastCandle.volume)} (${volRatio.toFixed(1)}x)`, padding.left + 3, volTop + 9);
+        } else {
+            const range = lastCandle.high - lastCandle.low;
+            const cp = range > 0 ? (lastCandle.close - lastCandle.low) / range : 0.5;
+            const buyVol = lastCandle.volume * cp;
+            const sellVol = lastCandle.volume * (1 - cp);
+            ctx.fillStyle = bullColor;
+            ctx.fillText(`B:${fmtVol(buyVol)}`, padding.left + 3, volTop + 9);
+            ctx.fillStyle = bearColor;
+            ctx.fillText(`S:${fmtVol(sellVol)}`, padding.left + 55, volTop + 9);
+            ctx.fillStyle = textColor;
+            ctx.fillText(`T:${fmtVol(lastCandle.volume)}`, padding.left + 107, volTop + 9);
+        }
+        
+        // Volume range on right axis
+        ctx.strokeStyle = gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(width - padding.right, volTop);
+        ctx.lineTo(width - padding.right, volTop + volumeHeight - 2);
+        ctx.stroke();
+        
+        ctx.font = '7px JetBrains Mono, monospace';
+        ctx.fillStyle = textColor;
+        ctx.textAlign = 'left';
+        ctx.globalAlpha = 0.6;
+        ctx.fillText(fmtVol(maxVol), width - padding.right + 3, volTop + 8);
+        ctx.fillText(fmtVol(maxVol / 2), width - padding.right + 3, volTop + volumeHeight / 2 + 3);
+        ctx.fillText('0', width - padding.right + 3, volTop + volumeHeight - 3);
+        ctx.globalAlpha = 1;
+    }
+    
+    // RSI
+    if (showRSI && data.rsiArray && data.rsiArray.length > 0) {
+        const rsiTop = padding.top + mainChartHeight + (showVolume ? volumeHeight : 0) + 2;
+        const rsiPeriods = state.settings.rsiLines || [14];
+        const rsiColorsList = state.settings.rsiColors || ['#a855f7'];
+        
+        // Panel border
+        ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(padding.left, rsiTop, chartWidth, rsiHeight - 2);
+        
+        // Overbought/Oversold zones
+        ctx.fillStyle = isDark ? 'rgba(239, 68, 68, 0.1)' : 'rgba(239, 68, 68, 0.15)';
+        ctx.fillRect(padding.left, rsiTop, chartWidth, rsiHeight * 0.3);
+        ctx.fillRect(padding.left, rsiTop + rsiHeight * 0.7, chartWidth, rsiHeight * 0.3);
+        
+        // Draw each RSI line
+        let primaryRSI = null;
+        let primaryRsiData = null;
+        const allRsiData = [];
+        rsiPeriods.forEach((period, pIdx) => {
+            const rsiArr = calculateRSIArray(data.candles, period);
+            const rsiStartIdx = Math.max(0, startIdx - period);
+            const rsiData = rsiArr.slice(rsiStartIdx, rsiStartIdx + displayCandles.length);
+            if (pIdx === 0) { primaryRSI = rsiData[rsiData.length - 1]; primaryRsiData = rsiData; }
+            allRsiData.push(rsiData);
+            
+            if (rsiData.length > 1) {
+                ctx.strokeStyle = rsiColorsList[pIdx] || '#a855f7';
+                ctx.lineWidth = pIdx === 0 ? 1.5 : 1;
+                ctx.beginPath();
+                rsiData.forEach((rsi, i) => {
+                    const x = padding.left + (i / (rsiData.length - 1)) * chartWidth;
+                    const y = rsiTop + rsiHeight - (rsi / 100) * rsiHeight;
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                });
+                ctx.stroke();
+            }
+        });
+        
+        // RSI info (primary line)
+        if (primaryRSI !== null && primaryRsiData) {
+            const currentRSI = primaryRSI;
+            const prevRSI = primaryRsiData.length >= 2 ? primaryRsiData[primaryRsiData.length - 2] : currentRSI;
+            const rsiZone = currentRSI >= 70 ? 'OB' : currentRSI <= 30 ? 'OS' : currentRSI >= 60 ? 'Bull' : currentRSI <= 40 ? 'Bear' : 'Neutral';
+            const rsiDir = currentRSI > prevRSI ? '↑' : currentRSI < prevRSI ? '↓' : '→';
+            const rsiZoneColor = currentRSI >= 70 ? bearColor : currentRSI <= 30 ? bullColor : '#a855f7';
+            
+            ctx.font = 'bold 8px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = rsiZoneColor;
+            const periodLabels = rsiPeriods.map(p => p).join('/');
+            ctx.fillText(`RSI(${periodLabels}) ${currentRSI.toFixed(1)} ${rsiDir} ${rsiZone}`, padding.left + 3, rsiTop + 9);
+            
+            // Divergence toggle button on RSI chart (drawn as button-like element)
+            const showDiv = state.settings.showRSIDivergence !== false;
+            const divBtnX = width - padding.right - 38;
+            const divBtnY = rsiTop + 1;
+            const divBtnW = 36;
+            const divBtnH = 12;
+            
+            // Draw button background
+            ctx.fillStyle = showDiv ? (isDark ? 'rgba(34,197,94,0.25)' : 'rgba(34,197,94,0.2)') : (isDark ? 'rgba(107,114,128,0.25)' : 'rgba(107,114,128,0.2)');
+            ctx.fillRect(divBtnX, divBtnY, divBtnW, divBtnH);
+            ctx.strokeStyle = showDiv ? '#22c55e' : '#6b7280';
+            ctx.lineWidth = 0.5;
+            ctx.strokeRect(divBtnX, divBtnY, divBtnW, divBtnH);
+            
+            // Button text
+            ctx.font = 'bold 7px JetBrains Mono, monospace';
+            ctx.fillStyle = showDiv ? '#22c55e' : '#6b7280';
+            ctx.textAlign = 'center';
+            ctx.fillText(showDiv ? '● DIV' : '○ DIV', divBtnX + divBtnW / 2, divBtnY + 9);
+            
+            // Store toggle hit area (CSS pixels, no DPR scaling)
+            canvas._rsiDivToggle = { x: divBtnX, y: divBtnY, w: divBtnW, h: divBtnH };
+        }
+        
+        // RSI Divergence detection per each RSI line
+        const showDiv = state.settings.showRSIDivergence !== false;
+        if (showDiv && displayCandles.length >= 10) {
+            allRsiData.forEach((rsiLineData, pIdx) => {
+                if (rsiLineData.length < 10) return;
+                const lineColor = rsiColorsList[pIdx] || '#a855f7';
+                const divs = detectRSIDivergence(displayCandles, rsiLineData);
+                divs.forEach(div => {
+                    const x1_price = padding.left + (div.i1 / (displayCandles.length - 1)) * chartWidth;
+                    const x2_price = padding.left + (div.i2 / (displayCandles.length - 1)) * chartWidth;
+                    const x1_rsi = padding.left + (div.i1 / (rsiLineData.length - 1)) * chartWidth;
+                    const x2_rsi = padding.left + (div.i2 / (rsiLineData.length - 1)) * chartWidth;
+                    
+                    const divColor = lineColor;
+                    const dashPattern = div.hidden ? [4, 3] : [];
+                    
+                    // Draw on RSI panel
+                    const y1_rsi = rsiTop + rsiHeight - (div.rsi1 / 100) * rsiHeight;
+                    const y2_rsi = rsiTop + rsiHeight - (div.rsi2 / 100) * rsiHeight;
+                    ctx.save();
+                    ctx.strokeStyle = divColor;
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash(dashPattern);
+                    ctx.beginPath();
+                    ctx.moveTo(x1_rsi, y1_rsi);
+                    ctx.lineTo(x2_rsi, y2_rsi);
+                    ctx.stroke();
+                    ctx.fillStyle = divColor;
+                    ctx.beginPath(); ctx.arc(x1_rsi, y1_rsi, 2, 0, Math.PI*2); ctx.fill();
+                    ctx.beginPath(); ctx.arc(x2_rsi, y2_rsi, 2, 0, Math.PI*2); ctx.fill();
+                    ctx.restore();
+                    
+                    // Draw on price chart
+                    const y1_p = scaleY(div.price1);
+                    const y2_p = scaleY(div.price2);
+                    ctx.save();
+                    ctx.strokeStyle = divColor;
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash(dashPattern);
+                    ctx.globalAlpha = 0.7;
+                    ctx.beginPath();
+                    ctx.moveTo(x1_price, y1_p);
+                    ctx.lineTo(x2_price, y2_p);
+                    ctx.stroke();
+                    ctx.fillStyle = divColor;
+                    ctx.beginPath(); ctx.arc(x1_price, y1_p, 2, 0, Math.PI*2); ctx.fill();
+                    ctx.beginPath(); ctx.arc(x2_price, y2_p, 2, 0, Math.PI*2); ctx.fill();
+                    ctx.globalAlpha = 1;
+                    ctx.font = 'bold 7px Inter, sans-serif';
+                    ctx.textAlign = 'center';
+                    const label = div.type === 'bullish' ? (div.hidden ? 'HD+' : 'D+') : (div.hidden ? 'HD−' : 'D−');
+                    ctx.fillText(label, x2_price, div.type === 'bullish' ? y2_p + 10 : y2_p - 6);
+                    ctx.restore();
+                });
+            });
+        }
+        
+        // RSI scale labels on right side (always visible)
+        ctx.strokeStyle = gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(width - padding.right, rsiTop);
+        ctx.lineTo(width - padding.right, rsiTop + rsiHeight);
+        ctx.stroke();
+        
+        ctx.font = '7px JetBrains Mono, monospace';
+        ctx.fillStyle = textColor;
+        ctx.textAlign = 'left';
+        ctx.globalAlpha = 0.6;
+        const rsiLevels = [70, 50, 30];
+        rsiLevels.forEach(lv => {
+            const ry = rsiTop + rsiHeight - (lv / 100) * rsiHeight;
+            ctx.fillText(lv, width - padding.right + 3, ry + 3);
+            ctx.strokeStyle = gridColor;
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath(); ctx.moveTo(padding.left, ry); ctx.lineTo(width - padding.right, ry); ctx.stroke();
+            ctx.setLineDash([]);
+        });
+        ctx.globalAlpha = 1;
+    }
+    
+    // MACD
+    if (showMACD && data.macdArray && data.macdArray.length > 0) {
+        const macdTop = padding.top + mainChartHeight + (showVolume ? volumeHeight : 0) + (showRSI ? rsiHeight : 0) + 2;
+        const macdData = data.macdArray.slice(-(displayCandles.length));
+        
+        // Panel border
+        ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(padding.left, macdTop, chartWidth, macdHeight - 2);
+        
+        if (macdData.length > 0) {
+            const histValues = macdData.map(m => m.histogram);
+            const allValues = [...macdData.map(m => m.macdLine), ...macdData.map(m => m.signal || 0), ...histValues];
+            const maxAbs = Math.max(...allValues.map(Math.abs)) || 1;
+            const maxHist = Math.max(...histValues.map(Math.abs)) || 1;
+            
+            // Helper to map MACD value to y
+            const macdY = (val) => macdTop + macdHeight / 2 - (val / maxAbs) * (macdHeight * 0.4);
+            
+            // Histogram bars
+            macdData.forEach((m, i) => {
+                const x = padding.left + (i / macdData.length) * chartWidth;
+                const barHeight = (Math.abs(m.histogram) / maxAbs) * (macdHeight * 0.4);
+                const y = macdTop + macdHeight / 2;
+                ctx.fillStyle = m.histogram >= 0 ? bullColor + '50' : bearColor + '50';
+                if (m.histogram >= 0) ctx.fillRect(x, y - barHeight, chartWidth / macdData.length * 0.6, barHeight);
+                else ctx.fillRect(x, y, chartWidth / macdData.length * 0.6, barHeight);
+            });
+            
+            // DIF line (MACD line) — blue
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            macdData.forEach((m, i) => {
+                const x = padding.left + (i / (macdData.length - 1)) * chartWidth;
+                const y = macdY(m.macdLine);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            // DEA line (Signal line) — orange
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            macdData.forEach((m, i) => {
+                if (m.signal === undefined) return;
+                const x = padding.left + (i / (macdData.length - 1)) * chartWidth;
+                const y = macdY(m.signal);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+            
+            // MACD info label
+            const cur = macdData[macdData.length - 1];
+            const prev = macdData.length >= 2 ? macdData[macdData.length - 2] : cur;
+            const histDir = cur.histogram > prev.histogram ? '↑' : cur.histogram < prev.histogram ? '↓' : '→';
+            const crossStatus = cur.histogram >= 0 && prev.histogram < 0 ? ' X↑' : cur.histogram < 0 && prev.histogram >= 0 ? ' X↓' : '';
+            
+            ctx.font = 'bold 7px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            // DIF value
+            ctx.fillStyle = '#3b82f6';
+            ctx.fillText(`DIF:${cur.macdLine.toFixed(4)}`, padding.left + 3, macdTop + 9);
+            // DEA value
+            ctx.fillStyle = '#f59e0b';
+            ctx.fillText(`DEA:${(cur.signal||0).toFixed(4)}`, padding.left + 75, macdTop + 9);
+            // Histogram value
+            ctx.fillStyle = cur.histogram >= 0 ? bullColor : bearColor;
+            ctx.fillText(`H:${cur.histogram >= 0 ? '+' : ''}${cur.histogram.toFixed(4)}${histDir}${crossStatus}`, padding.left + 147, macdTop + 9);
+            
+            // MACD scale on right side
+            ctx.strokeStyle = gridColor;
+            ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(width - padding.right, macdTop);
+            ctx.lineTo(width - padding.right, macdTop + macdHeight);
+            ctx.stroke();
+            
+            // Zero line + scale labels
+            const zeroY = macdTop + macdHeight / 2;
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath(); ctx.moveTo(padding.left, zeroY); ctx.lineTo(width - padding.right, zeroY); ctx.stroke();
+            ctx.setLineDash([]);
+            
+            ctx.font = '7px JetBrains Mono, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = textColor;
+            ctx.globalAlpha = 0.6;
+            ctx.fillText('0', width - padding.right + 3, zeroY + 3);
+            ctx.fillText('+', width - padding.right + 3, macdTop + 8);
+            ctx.fillText('−', width - padding.right + 3, macdTop + macdHeight - 2);
+            ctx.globalAlpha = 1;
+        }
+    }
+    
+    // Fair Value Gaps (FVG)
+    const showFVG = state.settings.showFVG !== false;
+    if (showFVG && displayCandles.length >= 3) {
+        const fvgs = detectFVG(displayCandles);
+        const fvgBullCol = state.settings.fvgBullColor || '#22c55e';
+        const fvgBearCol = state.settings.fvgBearColor || '#ef4444';
+        fvgs.forEach(gap => {
+            const gapTop = scaleY(gap.top);
+            const gapBot = scaleY(gap.bottom);
+            const gapH = Math.abs(gapBot - gapTop);
+            const startX = padding.left + gap.startIdx * candleSpacing;
+            const endX = padding.left + chartWidth;
+            
+            ctx.save();
+            if (gap.type === 'bullish') {
+                ctx.fillStyle = fvgBullCol + '20';
+                ctx.strokeStyle = fvgBullCol + '66';
+            } else {
+                ctx.fillStyle = fvgBearCol + '20';
+                ctx.strokeStyle = fvgBearCol + '66';
+            }
+            ctx.fillRect(startX, Math.min(gapTop, gapBot), endX - startX, Math.max(gapH, 1));
+            ctx.setLineDash([3, 3]);
+            ctx.lineWidth = 0.5;
+            ctx.strokeRect(startX, Math.min(gapTop, gapBot), endX - startX, Math.max(gapH, 1));
+            ctx.setLineDash([]);
+            
+            // Label
+            ctx.font = 'bold 6px JetBrains Mono, monospace';
+            ctx.fillStyle = gap.type === 'bullish' ? fvgBullCol : fvgBearCol;
+            ctx.textAlign = 'left';
+            ctx.globalAlpha = 0.7;
+            ctx.fillText('FVG', startX + 2, Math.min(gapTop, gapBot) + (gapH > 8 ? gapH / 2 + 3 : -2));
+            ctx.globalAlpha = 1;
+            ctx.restore();
+        });
+    }
+    
+    // Current candle highlight
+    const lastX = padding.left + (displayCandles.length - 1) * candleSpacing + candleSpacing / 2;
+    ctx.strokeStyle = data.isBullish ? bullColor : bearColor;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(lastX - candleWidth / 2 - 2, padding.top, candleWidth + 4, mainChartHeight);
+    
+    // Draw confluence marker (arrow) on current candle if confluence is high
+    const showMarkers = state.settings.showChartMarkers !== false;
+    const confluenceScore = state.confluenceScore || 50;
+    if (showMarkers && (confluenceScore >= 65 || confluenceScore <= 35)) {
+        const lastCandle = displayCandles[displayCandles.length - 1];
+        const markerX = lastX;
+        const isBullishConfluence = confluenceScore >= 65;
+        
+        ctx.save();
+        ctx.font = 'bold 14px sans-serif';
+        ctx.textAlign = 'center';
+        
+        if (isBullishConfluence) {
+            // Green up arrow below the candle
+            const markerY = scaleY(lastCandle.low) + 18;
+            ctx.fillStyle = bullColor;
+            ctx.fillText('▲', markerX, markerY);
+            // Small label
+            ctx.font = 'bold 7px Inter, sans-serif';
+            ctx.fillText(`${confluenceScore.toFixed(0)}%`, markerX, markerY + 8);
+        } else {
+            // Red down arrow above the candle
+            const markerY = scaleY(lastCandle.high) - 8;
+            ctx.fillStyle = bearColor;
+            ctx.fillText('▼', markerX, markerY);
+            // Small label
+            ctx.font = 'bold 7px Inter, sans-serif';
+            ctx.fillText(`${confluenceScore.toFixed(0)}%`, markerX, markerY - 8);
+        }
+        ctx.restore();
+    }
+    
+    // Draw indicator legend in top-right corner
+    // (maColors and emaColors already defined above)
+    
+    if (showMA || showEMA || showVWAP || showSR) {
+        ctx.font = 'bold 7px JetBrains Mono, monospace';
+        ctx.textAlign = 'right';
+        let legendY = padding.top + 8;
+        const legendX = width - padding.right - 3;
+        
+        if (showMA) {
+            const maLines = state.settings.maLines || [20];
+            maLines.forEach((period, idx) => {
+                ctx.fillStyle = maColors[idx % maColors.length];
+                ctx.fillText(`MA${period}`, legendX, legendY);
+                legendY += 8;
+            });
+        }
+        if (showEMA) {
+            const emaLines = state.settings.emaLines || [21];
+            emaLines.forEach((period, idx) => {
+                ctx.fillStyle = emaColors[idx % emaColors.length];
+                ctx.fillText(`E${period}`, legendX, legendY);
+                legendY += 8;
+            });
+        }
+        if (showVWAP) {
+            ctx.fillStyle = vwapColor;
+            ctx.fillText('VW', legendX, legendY);
+            legendY += 8;
+        }
+        if (showSR) {
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.8)';
+            ctx.fillText('S/R', legendX, legendY);
+        }
+    }
+}
+
+function setupChartInteraction(canvasId, tfId, opts = {}) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    
+    const chartState = initChartState(tfId);
+    const data = opts.data || state.data[tfId];
+    if (!data) return;
+    
+    const interactionDecimals = opts.decimals || state.currentCoin?.decimals || 4;
+    
+    // Create tooltip element if not exists
+    let tooltip = document.getElementById('pattern-tooltip');
+    if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'pattern-tooltip';
+        tooltip.className = 'pattern-tooltip';
+        tooltip.style.display = 'none';
+        document.body.appendChild(tooltip);
+    }
+    
+    // Create candle popup element if not exists
+    let candlePopup = document.getElementById('candle-popup');
+    if (!candlePopup) {
+        candlePopup = document.createElement('div');
+        candlePopup.id = 'candle-popup';
+        candlePopup.className = 'candle-popup';
+        candlePopup.style.display = 'none';
+        document.body.appendChild(candlePopup);
+    }
+    
+    // Helper to show candle popup
+    function showCandlePopup(candleInfo, x, y) {
+        const decimals = interactionDecimals;
+        const vol = candleInfo.candle.volume;
+        const buyVol = vol * (candleInfo.buyPct / 100);
+        const sellVol = vol * (candleInfo.sellPct / 100);
+        
+        candlePopup.innerHTML = `
+            <div class="candle-popup-header">
+                <span>${candleInfo.isBull ? '🟢 Bull' : '🔴 Bear'}</span>
+                <span class="candle-popup-close" onclick="document.getElementById('candle-popup').style.display='none'">✕</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">O:</span>
+                <span class="candle-popup-value">${candleInfo.candle.open.toFixed(decimals)}</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">H:</span>
+                <span class="candle-popup-value">${candleInfo.candle.high.toFixed(decimals)}</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">L:</span>
+                <span class="candle-popup-value">${candleInfo.candle.low.toFixed(decimals)}</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">C:</span>
+                <span class="candle-popup-value">${candleInfo.candle.close.toFixed(decimals)}</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Volume:</span>
+                <span class="candle-popup-value">${formatVolume(vol)}</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Buy:</span>
+                <span class="candle-popup-value bull">${candleInfo.buyPct.toFixed(1)}%</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Sell:</span>
+                <span class="candle-popup-value bear">${candleInfo.sellPct.toFixed(1)}%</span>
+            </div>
+            <div class="candle-popup-bar">
+                <div class="candle-popup-bar-buy" style="width:${candleInfo.buyPct}%"></div>
+                <div class="candle-popup-bar-sell" style="width:${candleInfo.sellPct}%"></div>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Body:</span>
+                <span class="candle-popup-value">${candleInfo.bodyPct.toFixed(1)}%</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Upper Wick:</span>
+                <span class="candle-popup-value">${candleInfo.upperWickPct.toFixed(1)}%</span>
+            </div>
+            <div class="candle-popup-row">
+                <span class="candle-popup-label">Lower Wick:</span>
+                <span class="candle-popup-value">${candleInfo.lowerWickPct.toFixed(1)}%</span>
+            </div>
+        `;
+        
+        // Position popup
+        candlePopup.style.display = 'block';
+        const popupRect = candlePopup.getBoundingClientRect();
+        let popupX = x + 10;
+        let popupY = y - 50;
+        
+        // Keep within viewport
+        if (popupX + popupRect.width > window.innerWidth) {
+            popupX = x - popupRect.width - 10;
+        }
+        if (popupY < 0) popupY = 10;
+        if (popupY + popupRect.height > window.innerHeight) {
+            popupY = window.innerHeight - popupRect.height - 10;
+        }
+        
+        candlePopup.style.left = popupX + 'px';
+        candlePopup.style.top = popupY + 'px';
+    }
+    
+    // Update the candle info tab above each chart
+    function updateCandleInfoTab(canvas, data, tfId, x) {
+        if (!canvas.candleData || canvas.candleData.length === 0) return;
+        
+        // Find the candle at the X position
+        let closestCandle = null;
+        let closestDist = Infinity;
+        
+        for (const cd of canvas.candleData) {
+            const candleCenterX = cd.x + cd.width / 2;
+            const dist = Math.abs(x - candleCenterX);
+            if (dist < closestDist) {
+                closestDist = dist;
+                closestCandle = cd;
+            }
+        }
+        
+        if (closestCandle) {
+            const tabEl = document.getElementById(`candleInfoTab-${tfId}`);
+            const oEl = document.getElementById(`candleO-${tfId}`);
+            const hEl = document.getElementById(`candleH-${tfId}`);
+            const lEl = document.getElementById(`candleL-${tfId}`);
+            const cEl = document.getElementById(`candleC-${tfId}`);
+            const vEl = document.getElementById(`candleV-${tfId}`);
+            const timeEl = document.getElementById(`candleTime-${tfId}`);
+            
+            const decimals = interactionDecimals;
+            
+            if (tabEl) tabEl.style.display = 'block';
+            if (oEl) oEl.textContent = '$' + closestCandle.candle.open.toFixed(decimals);
+            if (hEl) hEl.textContent = '$' + closestCandle.candle.high.toFixed(decimals);
+            if (lEl) lEl.textContent = '$' + closestCandle.candle.low.toFixed(decimals);
+            if (cEl) cEl.textContent = '$' + closestCandle.candle.close.toFixed(decimals);
+            if (vEl) vEl.textContent = formatVolume(closestCandle.candle.volume);
+            if (timeEl) {
+                const date = new Date(closestCandle.candle.openTime);
+                timeEl.textContent = date.toLocaleString('en-US', { 
+                    month: 'short', 
+                    day: 'numeric', 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                });
+            }
+        }
+    }
+    
+    // Helper to find candle at position
+    function findCandleAt(x, y) {
+        if (!canvas.candleData) return null;
+        const dpr = window.devicePixelRatio || 1;
+        const scaledX = x;
+        const scaledY = y;
+        
+        for (const cd of canvas.candleData) {
+            // Expand hit area for easier selection
+            const hitPadding = 5;
+            if (scaledX >= cd.x - hitPadding && 
+                scaledX <= cd.x + cd.width + hitPadding && 
+                scaledY >= cd.y - hitPadding && 
+                scaledY <= cd.y + cd.height + hitPadding) {
+                return cd;
+            }
+        }
+        return null;
+    }
+    
+    // Long press timer for mobile
+    let longPressTimer = null;
+    let longPressTriggered = false;
+    
+    // Mouse events - click on candle shows popup
+    canvas.addEventListener('mousedown', (e) => {
+        chartState.isDragging = true;
+        chartState.lastX = e.clientX;
+        canvas.style.cursor = 'grabbing';
+    });
+    
+    // Double click to show candle popup on desktop
+    canvas.addEventListener('click', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        const dpr = window.devicePixelRatio || 1;
+        
+        // Check RSI Divergence toggle click
+        if (canvas._rsiDivToggle) {
+            const t = canvas._rsiDivToggle;
+            if (x >= t.x && x <= t.x + t.w && y >= t.y && y <= t.y + t.h) {
+                state.settings.showRSIDivergence = !state.settings.showRSIDivergence;
+                const divEl = document.getElementById('showRSIDivergence');
+                if (divEl) divEl.checked = state.settings.showRSIDivergence;
+                saveSettings();
+                drawInteractiveChart(canvasId, data, tfId, opts);
+                return;
+            }
+        }
+        
+        // Only show popup on click if in click-popup mode
+        if (state.settings.candlePopupType !== 'click-popup') return;
+        
+        const candleInfo = findCandleAt(x, y);
+        if (candleInfo) {
+            showCandlePopup(candleInfo, e.clientX, e.clientY);
+        }
+    });
+    
+    canvas.addEventListener('mousemove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        
+        // Calculate hovered candle index for highlight column
+        if (!chartState.isDragging && canvas.candleData && canvas.candleData.length > 0) {
+            let closestIdx = -1;
+            let closestDist = Infinity;
+            for (let i = 0; i < canvas.candleData.length; i++) {
+                const cd = canvas.candleData[i];
+                const cx = cd.x + cd.width / 2;
+                const dist = Math.abs(x - cx);
+                if (dist < closestDist) { closestDist = dist; closestIdx = i; }
+            }
+            if (closestIdx !== canvas.hoveredCandleIdx) {
+                canvas.hoveredCandleIdx = closestIdx;
+                drawInteractiveChart(canvasId, data, tfId, opts);
+            }
+        }
+        
+        // Update candle info tab only if in hover-tab mode
+        if (state.settings.candlePopupType === 'hover-tab') {
+            updateCandleInfoTab(canvas, data, tfId, x);
+        }
+        
+        // Pattern tooltip on hover
+        if (canvas.patternData && canvas.patternData.length > 0 && !chartState.isDragging) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            
+            let foundPattern = null;
+            for (const p of canvas.patternData) {
+                if (x >= p.x && x <= p.x + p.width && y >= p.y && y <= p.y + p.height) {
+                    foundPattern = p;
+                    break;
+                }
+            }
+            
+            if (foundPattern) {
+                tooltip.textContent = `${foundPattern.name} (${foundPattern.type})`;
+                tooltip.style.display = 'block';
+                tooltip.style.left = (e.clientX + 10) + 'px';
+                tooltip.style.top = (e.clientY - 20) + 'px';
+            } else {
+                tooltip.style.display = 'none';
+            }
+        }
+        
+        if (!chartState.isDragging) return;
+        const dx = e.clientX - chartState.lastX;
+        chartState.panX += dx * 0.2;
+        chartState.lastX = e.clientX;
+        drawInteractiveChart(canvasId, data, tfId, opts);
+    });
+    
+    canvas.addEventListener('mouseup', () => {
+        chartState.isDragging = false;
+        canvas.style.cursor = 'grab';
+    });
+    
+    canvas.addEventListener('mouseleave', () => {
+        chartState.isDragging = false;
+        canvas.style.cursor = 'grab';
+        tooltip.style.display = 'none';
+        // Clear hover highlight
+        if (canvas.hoveredCandleIdx !== -1) {
+            canvas.hoveredCandleIdx = -1;
+            drawInteractiveChart(canvasId, data, tfId, opts);
+        }
+        // Hide the candle info tab for this chart
+        const tabEl = document.getElementById(`candleInfoTab-${tfId}`);
+        if (tabEl) tabEl.style.display = 'none';
+    });
+    
+    // Scroll to zoom
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const delta = e.deltaY > 0 ? 0.9 : 1.1;
+        chartState.zoom = Math.max(0.3, Math.min(5, chartState.zoom * delta));
+        drawInteractiveChart(canvasId, data, tfId, opts);
+    });
+    
+    // Touch events with pinch-to-zoom and long press
+    let touchStartX = 0;
+    let touchStartY = 0;
+    let lastTouchDistance = 0;
+    let isTouchZooming = false;
+    let touchMoved = false;
+    
+    canvas.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 2) {
+            // Pinch zoom start
+            isTouchZooming = true;
+            longPressTriggered = false;
+            clearTimeout(longPressTimer);
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            lastTouchDistance = Math.sqrt(dx * dx + dy * dy);
+        } else if (e.touches.length === 1) {
+            isTouchZooming = false;
+            touchMoved = false;
+            touchStartX = e.touches[0].clientX;
+            touchStartY = e.touches[0].clientY;
+            
+            // Start long press timer
+            longPressTimer = setTimeout(() => {
+                if (!touchMoved) {
+                    const rect = canvas.getBoundingClientRect();
+                    const x = touchStartX - rect.left;
+                    const y = touchStartY - rect.top;
+                    
+                    const candleInfo = findCandleAt(x, y);
+                    if (candleInfo) {
+                        longPressTriggered = true;
+                        showCandlePopup(candleInfo, touchStartX, touchStartY);
+                        // Vibrate if supported
+                        if (navigator.vibrate) navigator.vibrate(50);
+                    }
+                }
+            }, 500); // 500ms long press
+        }
+    }, { passive: true });
+    
+    canvas.addEventListener('touchmove', (e) => {
+        const dx = e.touches[0].clientX - touchStartX;
+        const dy = e.touches[0].clientY - touchStartY;
+        
+        // Update candle info tab on touch move
+        if (e.touches.length === 1) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.touches[0].clientX - rect.left;
+            updateCandleInfoTab(canvas, data, tfId, x);
+        }
+        
+        // If moved more than 10px, cancel long press
+        if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+            touchMoved = true;
+            clearTimeout(longPressTimer);
+        }
+        
+        if (longPressTriggered) {
+            e.preventDefault();
+            return;
+        }
+        
+        e.preventDefault();
+        
+        if (e.touches.length === 2 && isTouchZooming) {
+            // Pinch zoom
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            
+            if (lastTouchDistance > 0) {
+                const scale = distance / lastTouchDistance;
+                chartState.zoom = Math.max(0.3, Math.min(5, chartState.zoom * scale));
+                drawInteractiveChart(canvasId, data, tfId, opts);
+            }
+            lastTouchDistance = distance;
+        } else if (e.touches.length === 1 && !isTouchZooming && touchMoved) {
+            // Pan
+            const dx = e.touches[0].clientX - touchStartX;
+            chartState.panX += dx * 0.2;
+            touchStartX = e.touches[0].clientX;
+            drawInteractiveChart(canvasId, data, tfId, opts);
+        }
+    }, { passive: false });
+    
+    canvas.addEventListener('touchend', (e) => {
+        clearTimeout(longPressTimer);
+        if (e.touches.length < 2) {
+            isTouchZooming = false;
+            lastTouchDistance = 0;
+        }
+        longPressTriggered = false;
+    }, { passive: true });
+    
+    // Close popup when clicking elsewhere
+    document.addEventListener('click', (e) => {
+        if (candlePopup && candlePopup.style.display !== 'none') {
+            if (!candlePopup.contains(e.target) && e.target !== canvas) {
+                candlePopup.style.display = 'none';
+            }
+        }
+    });
+}
+
+// ============================================
+// TIMER MANAGEMENT
+// ============================================
+
+function startTimerLoop() {
+    if (state.intervals.timer) clearInterval(state.intervals.timer);
+    state.intervals.timer = setInterval(updateTimers, 1000);
+    updateTimers();
+}
+
+function getSecondsToClose(tf) {
+    const now = new Date();
+    const currentMinute = now.getMinutes();
+    const currentSecond = now.getSeconds();
+    
+    if (tf.minutes === 240) {
+        const currentHour = now.getHours();
+        const hourIn4h = currentHour % 4;
+        const remainingHours = 3 - hourIn4h;
+        return remainingHours * 3600 + (59 - currentMinute) * 60 + (60 - currentSecond);
+    } else {
+        const currentTotalSeconds = currentMinute * 60 + currentSecond;
+        const tfSeconds = tf.minutes * 60;
+        return tfSeconds - (currentTotalSeconds % tfSeconds);
+    }
+}
+
+function updateTimers() {
+    let alertingCount = 0;
+    
+    state.timeframes.forEach(tf => {
+        const secondsToClose = getSecondsToClose(tf);
+        const timeStr = formatTime(secondsToClose);
+        const isAlert = tf.enabled && secondsToClose <= state.settings.alertSeconds;
+        
+        const btnEl = document.querySelector(`.tf-toggle-btn[data-tf="${tf.id}"]`);
+        const btnTimerEl = document.getElementById(`tf-btn-timer-${tf.id}`);
+        
+        if (btnEl && btnTimerEl) {
+            btnTimerEl.textContent = timeStr;
+            btnEl.classList.toggle('alert', isAlert);
+        }
+        
+        const tfTimerEl = document.getElementById(`tf-timer-${tf.id}`);
+        if (tfTimerEl) {
+            tfTimerEl.textContent = timeStr;
+            tfTimerEl.classList.toggle('alert', isAlert);
+        }
+        
+        if (isAlert) alertingCount++;
+    });
+    
+    const alertBadge = document.getElementById('alertBadge');
+    const alertCount = document.getElementById('alertCount');
+    
+    if (alertingCount >= state.settings.minConfluence) {
+        alertBadge.style.display = 'flex';
+        alertCount.textContent = alertingCount;
+        if (state.settings.enableSound && !state.alertPlayed) {
+            playAlertSound();
+            state.alertPlayed = true;
+        }
+    } else {
+        alertBadge.style.display = 'none';
+        state.alertPlayed = false;
+    }
+}
+
+function formatTime(seconds) {
+    if (seconds >= 3600) {
+        const hours = Math.floor(seconds / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        const secs = seconds % 60;
+        return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${Math.floor(seconds / 60)}:${(seconds % 60).toString().padStart(2, '0')}`;
+}
+
+function playAlertSound() {
+    try {
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        oscillator.frequency.value = 800;
+        oscillator.type = 'sine';
+        gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+        oscillator.start(audioContext.currentTime);
+        oscillator.stop(audioContext.currentTime + 0.5);
+    } catch (e) {}
+}
+
+// ============================================
+// UI RENDERING
+// ============================================
+
+function renderTFTogglesWithTimers() {
+    const container = document.getElementById('mainBlockToggles');
+    if (!container) return;
+    
+    container.innerHTML = state.timeframes.map(tf => {
+        const secondsToClose = getSecondsToClose(tf);
+        const isAlert = tf.enabled && secondsToClose <= state.settings.alertSeconds;
+        
+        return `
+            <div class="tf-toggle-btn ${tf.enabled ? 'active' : ''} ${isAlert ? 'alert' : ''}" data-tf="${tf.id}">
+                <span class="tf-toggle-label">${tf.label}</span>
+                <span class="tf-toggle-timer" id="tf-btn-timer-${tf.id}">${formatTime(secondsToClose)}</span>
+            </div>
+        `;
+    }).join('');
+    
+    container.querySelectorAll('.tf-toggle-btn').forEach(btn => {
+        btn.addEventListener('click', () => toggleTimeframe(btn.dataset.tf));
+    });
+}
+
+function toggleTimeframe(tfId) {
+    const tf = state.timeframes.find(t => t.id === tfId);
+    if (tf) {
+        tf.enabled = !tf.enabled;
+        saveSettings();
+        renderTFTogglesWithTimers();
+        fetchAllCandleData();
+        // Reconnect WebSocket with updated streams
+        setTimeout(() => wsConnect(), 500);
+    }
+}
+
+// ============ SHARED TF ROW RENDERING ============
+// Used by both main coin and added coin panels
+
+function buildBadgeAlertsHtml(data, symbol) {
+    if (!data || !data.alerts) return '<span class="alert-group dim">--</span>';
+    
+    const alerts = data.alerts;
+    const activeAlerts = [];
+    
+    // Badge toggle checker — checks per-symbol first, falls back to main
+    const bOn = (key) => {
+        if (symbol) {
+            const perSymEl = document.getElementById(`badge-${symbol}-${key}`);
+            if (perSymEl) return perSymEl.checked;
+        }
+        const mainEl = document.getElementById(`badge${key}`);
+        return mainEl ? mainEl.checked : true;
+    };
+    
+    // RSI group
+    if (alerts.extremeOB && bOn('ExtOB')) activeAlerts.push({ label: 'ExtOB', class: 'rsi-ob', priority: 1 });
+    else if (alerts.overbought && bOn('OB')) activeAlerts.push({ label: 'OB', class: 'rsi-ob', priority: 2 });
+    if (alerts.extremeOS && bOn('ExtOS')) activeAlerts.push({ label: 'ExtOS', class: 'rsi-os', priority: 1 });
+    else if (alerts.oversold && bOn('OS')) activeAlerts.push({ label: 'OS', class: 'rsi-os', priority: 2 });
+    
+    // Volume group
+    if (alerts.volSpike && bOn('VolSpike')) activeAlerts.push({ label: 'VolSpike', class: 'vol-high', priority: 1 });
+    else if (alerts.highVol && bOn('HighVol')) activeAlerts.push({ label: 'HighVol', class: 'vol-high', priority: 3 });
+    if (alerts.lowVol && bOn('LowVol')) activeAlerts.push({ label: 'LowVol', class: 'vol-low', priority: 4 });
+    
+    // MACD group — crosses highest priority
+    if (alerts.macdCrossUp && bOn('MACDCrossUp')) activeAlerts.push({ label: 'MACDx↑', class: 'macd-bull', priority: 1 });
+    else if (alerts.macdBull && bOn('MACDUp')) activeAlerts.push({ label: 'MACD↑', class: 'macd-bull', priority: 3 });
+    if (alerts.macdCrossDown && bOn('MACDCrossDown')) activeAlerts.push({ label: 'MACDx↓', class: 'macd-bear', priority: 1 });
+    else if (alerts.macdBear && bOn('MACDDown')) activeAlerts.push({ label: 'MACD↓', class: 'macd-bear', priority: 3 });
+    
+    // Candle structure
+    if (alerts.bigBody && bOn('BigBody')) activeAlerts.push({ label: 'BigBody', class: data.isBullish ? 'macd-bull' : 'macd-bear', priority: 3 });
+    if (alerts.indecision && bOn('Indecision')) activeAlerts.push({ label: 'Indeci', class: 'neutral', priority: 5 });
+    if (alerts.rejectHigh && bOn('RejHi')) activeAlerts.push({ label: 'RejHi', class: 'rsi-ob', priority: 4 });
+    if (alerts.rejectLow && bOn('RejLo')) activeAlerts.push({ label: 'RejLo', class: 'rsi-os', priority: 4 });
+    
+    // Engulfing patterns
+    if (alerts.bullEngulfing && bOn('Engulf')) activeAlerts.push({ label: 'BullEng', class: 'macd-bull', priority: 1 });
+    if (alerts.bearEngulfing && bOn('Engulf')) activeAlerts.push({ label: 'BearEng', class: 'macd-bear', priority: 1 });
+    
+    // Sort by priority and take top 5
+    activeAlerts.sort((a, b) => a.priority - b.priority);
+    const topAlerts = activeAlerts.slice(0, 5);
+    const moreCount = activeAlerts.length - 5;
+    
+    if (topAlerts.length === 0) return '<span class="alert-group dim">No alerts</span>';
+    
+    return topAlerts.map(a => `<span class="alert-group ${a.class}">${a.label}</span>`).join('') +
+        (moreCount > 0 ? `<span class="alerts-more" title="${activeAlerts.slice(5).map(a => a.label).join(', ')}">+${moreCount}</span>` : '');
+}
+
+function buildTfRowHtml(tfLabel, tfId, data, opts = {}) {
+    const { decimals = 2, symbol = '', currentPrice = null, timerAlert = false } = opts;
+    const showPriceInfo = state.settings.showPriceInfo !== false;
+    const showTimers = state.settings.showTimers !== false;
+    const showConfBar = state.settings.showConfluenceBar !== false;
+    
+    if (!data || typeof data !== 'object') return '<div class="tf-row"><span style="color:var(--text-muted)">No data</span></div>';
+    const dirClass = showConfBar ? (data.isBullish ? 'bullish' : 'bearish') : '';
+    const dirEmoji = data.isBullish ? '🟢' : '🔴';
+    
+    const prefix = symbol ? `${symbol}-` : '';
+    const canvasId = `chart-${prefix}${tfId}`;
+    const tabId = `candleInfoTab-${prefix}${tfId}`;
+    const secondsToClose = getSecondsToClose(state.timeframes.find(t => t.id === tfId) || { minutes: 1 });
+    
+    const price = currentPrice || data.current?.close || 0;
+    const tfHigh = data.current?.high || 0;
+    const tfLow = data.current?.low || 0;
+    const changePct = data.changePct || 0;
+    
+    const timerHtml = showTimers ? `<span class="tf-timer ${timerAlert ? 'alert' : ''}" id="tf-timer-${prefix}${tfId}">${formatTime(secondsToClose)}</span>` : '';
+    
+    const alertsHtml = buildBadgeAlertsHtml(data, symbol || null);
+    
+    return `
+        <div class="tf-row ${dirClass}" data-tf="${tfId}">
+            <div class="tf-info">
+                <div class="tf-info-row tf-info-primary">
+                    <span class="tf-name">${tfLabel}</span>
+                    <span class="tf-direction">${dirEmoji}</span>
+                    ${timerHtml}
+                    ${showPriceInfo ? `<span class="tf-price-value" id="tf-price-${prefix}${tfId}">$${price.toFixed(decimals)}</span>
+                    <span class="tf-price-change ${changePct >= 0 ? 'positive' : 'negative'}" id="tf-change-${prefix}${tfId}">${changePct >= 0 ? '+' : ''}${changePct.toFixed(2)}%</span>` : ''}
+                </div>
+                ${showPriceInfo ? `<div class="tf-info-row tf-info-secondary">
+                    <span class="tf-price-hl" id="tf-high-${prefix}${tfId}">H:$${tfHigh.toFixed(decimals)}</span>
+                    <span class="tf-price-hl" id="tf-low-${prefix}${tfId}">L:$${tfLow.toFixed(decimals)}</span>
+                    <span class="tf-stat-mini">B${data.bodyPct.toFixed(0)}%</span>
+                </div>` : ''}
+            </div>
+            <div class="tf-chart-wrapper">
+                <div class="candle-info-tab" id="${tabId}" style="display:none;">
+                    <div class="candle-info-tf">${tfLabel}</div>
+                    <div class="candle-info-data">
+                        <span class="candle-info-item"><b class="label-open">O:</b> <span id="candleO-${prefix}${tfId}" class="price-open">--</span></span>
+                        <span class="candle-info-item"><b class="label-high">H:</b> <span id="candleH-${prefix}${tfId}" class="price-high">--</span></span>
+                        <span class="candle-info-item"><b class="label-low">L:</b> <span id="candleL-${prefix}${tfId}" class="price-low">--</span></span>
+                        <span class="candle-info-item"><b class="label-close">C:</b> <span id="candleC-${prefix}${tfId}" class="price-close">--</span></span>
+                        <span class="candle-info-item"><b class="label-volume">V:</b> <span id="candleV-${prefix}${tfId}" class="price-volume">--</span></span>
+                        <span class="candle-info-item candle-info-time"><span id="candleTime-${prefix}${tfId}">--</span></span>
+                    </div>
+                </div>
+                <div class="tf-chart-container">
+                    <canvas id="${canvasId}" class="tf-chart-canvas"></canvas>
+                    <span class="chart-help">Drag • Scroll zoom</span>
+                </div>
+            </div>
+            <div class="tf-bottom">
+                <div class="tf-bottom-alerts">${alertsHtml}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderTimeframeRows() {
+    const container = document.getElementById('timeframesList');
+    if (!container) return;
+    
+    const enabledTFs = state.timeframes.filter(tf => tf.enabled);
+    
+    if (enabledTFs.length === 0) {
+        container.innerHTML = '<p style="text-align:center;color:var(--text-muted);padding:2rem;">Select timeframes above</p>';
+        return;
+    }
+    
+    container.innerHTML = enabledTFs.map(tf => {
+        const data = state.data[tf.id];
+        const canvasId = `chart-${tf.id}`;
+        const secondsToClose = getSecondsToClose(tf);
+        const timerAlert = secondsToClose <= state.settings.alertSeconds;
+        
+        if (!data) {
+            return `
+                <div class="tf-row" data-tf="${tf.id}">
+                    <div class="tf-info">
+                        <div class="tf-info-row tf-info-primary">
+                            <span class="tf-name">${tf.label}</span>
+                            <span class="tf-direction">⏳</span>
+                            <div class="tf-timer" id="tf-timer-${tf.id}">--:--</div>
+                        </div>
+                    </div>
+                    <div class="tf-chart-wrapper">
+                        <div class="candle-info-tab" id="candleInfoTab-${tf.id}" style="display:none;">
+                            <div class="candle-info-tf">${tf.label}</div>
+                            <div class="candle-info-data">
+                                <span class="candle-info-item"><b class="label-open">O:</b> <span id="candleO-${tf.id}" class="price-open">--</span></span>
+                                <span class="candle-info-item"><b class="label-high">H:</b> <span id="candleH-${tf.id}" class="price-high">--</span></span>
+                                <span class="candle-info-item"><b class="label-low">L:</b> <span id="candleL-${tf.id}" class="price-low">--</span></span>
+                                <span class="candle-info-item"><b class="label-close">C:</b> <span id="candleC-${tf.id}" class="price-close">--</span></span>
+                                <span class="candle-info-item"><b class="label-volume">V:</b> <span id="candleV-${tf.id}" class="price-volume">--</span></span>
+                                <span class="candle-info-item candle-info-time"><span id="candleTime-${tf.id}">--</span></span>
+                            </div>
+                        </div>
+                        <div class="tf-chart-container">
+                            <canvas id="${canvasId}" class="tf-chart-canvas"></canvas>
+                            <span class="chart-help">Drag • Scroll zoom</span>
+                        </div>
+                    </div>
+                    <div class="tf-alerts"><span style="color:var(--text-muted)">Loading...</span></div>
+                </div>
+            `;
+        }
+        
+        const showConfBar = state.settings.showConfluenceBar !== false;
+        const coinData = state.coinData[state.currentCoin?.symbol] || {};
+        const currentPrice = coinData.price || data.current?.close || 0;
+        const decimals = state.currentCoin?.decimals || 2;
+        
+        return buildTfRowHtml(tf.label, tf.id, data, {
+            decimals,
+            currentPrice,
+            timerAlert
+        });
+    }).join('');
+    
+    // Draw charts and setup interactions
+    setTimeout(() => {
+        enabledTFs.forEach(tf => {
+            const data = state.data[tf.id];
+            if (data) {
+                const canvasId = `chart-${tf.id}`;
+                drawInteractiveChart(canvasId, data, tf.id);
+                setupChartInteraction(canvasId, tf.id);
+            }
+        });
+    }, 50);
+}
+
+function updatePriceDisplay(data) {
+    // Update coin data state (used by TF price info display)
+    if (state.currentCoin) {
+        const price = parseFloat(data.lastPrice);
+        const change = parseFloat(data.priceChangePercent);
+        const high = parseFloat(data.highPrice);
+        const low = parseFloat(data.lowPrice);
+        const volume = parseFloat(data.quoteVolume);
+        
+        state.coinData[state.currentCoin.symbol] = {
+            price,
+            change,
+            high,
+            low,
+            volume
+        };
+        
+        // Targeted price update - don't rebuild entire DOM
+        const decimals = state.currentCoin.decimals || 2;
+        const enabledTFs = state.timeframes.filter(tf => tf.enabled);
+        
+        enabledTFs.forEach(tf => {
+            const priceEl = document.getElementById(`tf-price-${tf.id}`);
+            if (priceEl) priceEl.textContent = `$${price.toFixed(decimals)}`;
+        });
+    }
+}
+
+function updateMethodFormulaDisplay() {
+    const method = state.settings.weightMethod || 'linear';
+    const methodData = WEIGHT_METHODS[method];
+    const methodNameEl = document.getElementById('methodName');
+    const methodFormulaEl = document.getElementById('methodFormula');
+    
+    if (methodNameEl && methodData) {
+        methodNameEl.textContent = method.charAt(0).toUpperCase() + method.slice(1);
+    }
+    if (methodFormulaEl && methodData) {
+        let formula = methodData.description || '';
+        const mods = [];
+        if (state.settings.useStrengthMod) mods.push('Body(×0.6-1.3)');
+        if (state.settings.useVolumeMod) mods.push('Vol(×0.7-1.4)');
+        if (state.settings.useIndicatorMod) mods.push('RSI+MACD momentum');
+        formula += '\nTrend: EMA21/50 alignment + candle + close position';
+        if (mods.length > 0) formula += `\nModifiers: ${mods.join(', ')}`;
+        methodFormulaEl.textContent = formula;
+    }
+}
+
+function updateConfluenceDisplay(pct, bullCount, bearCount, tfWeights, signal) {
+    const fill = document.getElementById('confluenceFill');
+    const scoreEl = document.getElementById('confluenceScore');
+    const bullEl = document.getElementById('bullCount');
+    const bearEl = document.getElementById('bearCount');
+    const biasEl = document.getElementById('biasIndicator');
+    const signalEl = document.getElementById('signalIndicator');
+    const methodName = document.getElementById('methodName');
+    const methodFormula = document.getElementById('methodFormula');
+    const methodWeights = document.getElementById('methodWeights');
+    
+    fill.style.left = `${pct}%`;
+    
+    scoreEl.querySelector('.stat-value').textContent = `${pct.toFixed(1)}%`;
+    scoreEl.querySelector('.stat-value').className = `stat-value ${pct >= 60 ? 'text-bull' : pct <= 40 ? 'text-bear' : 'text-neutral'}`;
+    
+    bullEl.querySelector('.stat-value').textContent = bullCount;
+    bearEl.querySelector('.stat-value').textContent = bearCount;
+    
+    let bias = '—', biasClass = '';
+    if (pct >= 70) { bias = '🟢 BULL'; biasClass = 'text-bull'; }
+    else if (pct <= 30) { bias = '🔴 BEAR'; biasClass = 'text-bear'; }
+    else { bias = '🟡 MIXED'; biasClass = 'text-neutral'; }
+    
+    biasEl.querySelector('.stat-value').textContent = bias;
+    biasEl.querySelector('.stat-value').className = `stat-value ${biasClass}`;
+    
+    // Signal display
+    if (signalEl && signal) {
+        const sv = signalEl.querySelector('.stat-value');
+        const prevSignal = sv.textContent;
+        
+        let displayText = signal.signal;
+        if (signal.pending) displayText += ` (→${signal.pending})`;
+        
+        sv.textContent = displayText;
+        sv.className = `stat-value signal-value ${signal.signalClass}`;
+        
+        // Pulse animation on new signal
+        if (signal.isNew && prevSignal !== signal.signal) {
+            sv.classList.add('signal-pulse');
+            setTimeout(() => sv.classList.remove('signal-pulse'), 4500);
+        }
+    }
+    
+    const method = state.settings.weightMethod || 'linear';
+    const methodData = WEIGHT_METHODS[method];
+    
+    if (methodName && methodData) {
+        methodName.textContent = method.charAt(0).toUpperCase() + method.slice(1);
+    }
+    
+    if (methodFormula && methodData) {
+        let formula = methodData.description || '';
+        const mods = [];
+        if (state.settings.useStrengthMod) mods.push('Body(×0.6-1.3)');
+        if (state.settings.useVolumeMod) mods.push('Vol(×0.7-1.4)');
+        if (state.settings.useIndicatorMod) mods.push('RSI+MACD momentum');
+        formula += '\nTrend: EMA21/50 alignment + candle + close position';
+        if (mods.length > 0) formula += `\nModifiers: ${mods.join(', ')}`;
+        methodFormula.textContent = formula;
+    }
+    
+    if (methodWeights && tfWeights.length > 0) {
+        methodWeights.innerHTML = tfWeights.map(w => 
+            `<div>${w.dir} ${w.tf}: ${w.base}→${w.final} [${w.score}] ${w.mods ? `(${w.mods})` : ''}</div>`
+        ).join('');
+    }
+}
+
+function formatVolume(vol) {
+    if (vol >= 1e9) return (vol / 1e9).toFixed(2) + 'B';
+    if (vol >= 1e6) return (vol / 1e6).toFixed(2) + 'M';
+    if (vol >= 1e3) return (vol / 1e3).toFixed(2) + 'K';
+    return vol.toFixed(2);
+}
+
+// ============================================
+// CONFLUENCE HISTORY TRACKING
+// ============================================
+
+function trackConfluenceHistory(pct, bias) {
+    // Only track high confluence (>= 70% bullish or <= 30% bearish)
+    if (pct < 70 && pct > 30) return;
+    
+    const now = new Date();
+    const currentPrice = state.coinData[state.currentCoin?.symbol]?.price || 0;
+    
+    // Don't record too frequently (min 5 minutes between records)
+    const lastRecord = state.confluenceHistory[0];
+    if (lastRecord) {
+        const timeDiff = now - new Date(lastRecord.time);
+        if (timeDiff < 5 * 60 * 1000) return; // Less than 5 minutes
+    }
+    
+    // Update results for previous records (price movement since then)
+    updateHistoryResults(currentPrice);
+    
+    // Add new record
+    const record = {
+        time: now.toISOString(),
+        timeDisplay: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        confluence: pct,
+        bias: bias,
+        price: currentPrice,
+        coin: state.currentCoin?.symbol,
+        result: null // Will be updated later
+    };
+    
+    state.confluenceHistory.unshift(record);
+    
+    // Keep only last 20 records
+    if (state.confluenceHistory.length > 20) {
+        state.confluenceHistory = state.confluenceHistory.slice(0, 20);
+    }
+    
+    // Save to localStorage
+    saveConfluenceHistory();
+    renderConfluenceHistory();
+}
+
+function updateHistoryResults(currentPrice) {
+    state.confluenceHistory.forEach(record => {
+        if (record.coin === state.currentCoin?.symbol && record.price && !record.resultLocked) {
+            const priceDiff = currentPrice - record.price;
+            const pctChange = (priceDiff / record.price) * 100;
+            record.result = pctChange;
+            
+            // Lock result after 30 minutes
+            const recordTime = new Date(record.time);
+            const now = new Date();
+            if (now - recordTime > 30 * 60 * 1000) {
+                record.resultLocked = true;
+            }
+        }
+    });
+}
+
+function saveConfluenceHistory() {
+    const key = `mtfcm_history_${state.currentCoin?.symbol}`;
+    localStorage.setItem(key, JSON.stringify(state.confluenceHistory.filter(r => r.coin === state.currentCoin?.symbol).slice(0, 10)));
+}
+
+function loadConfluenceHistory() {
+    if (!state.currentCoin) return;
+    const key = `mtfcm_history_${state.currentCoin.symbol}`;
+    const saved = localStorage.getItem(key);
+    if (saved) {
+        try {
+            const loaded = JSON.parse(saved);
+            // Merge with existing history, keeping unique times
+            const existing = state.confluenceHistory.filter(r => r.coin !== state.currentCoin.symbol);
+            state.confluenceHistory = [...loaded, ...existing];
+        } catch (e) {
+            console.error('Error loading confluence history:', e);
+        }
+    }
+    renderConfluenceHistory();
+}
+
+function renderConfluenceHistory() {
+    const container = document.getElementById('historyList');
+    if (!container) return;
+    
+    const coinHistory = state.confluenceHistory.filter(r => r.coin === state.currentCoin?.symbol);
+    
+    if (coinHistory.length === 0) {
+        container.innerHTML = '<div class="history-empty">No high confluence moments recorded yet</div>';
+        return;
+    }
+    
+    container.innerHTML = coinHistory.slice(0, 10).map(record => {
+        const biasClass = record.bias === 'BULL' ? 'bull' : 'bear';
+        const confClass = record.confluence >= 50 ? 'bull' : 'bear';
+        const resultClass = record.result > 0 ? 'positive' : record.result < 0 ? 'negative' : '';
+        const resultText = record.result !== null ? `${record.result >= 0 ? '+' : ''}${record.result.toFixed(2)}%` : '--';
+        
+        return `
+            <div class="history-item">
+                <span class="history-time">${record.timeDisplay}</span>
+                <span class="history-conf ${confClass}">${record.confluence.toFixed(0)}%</span>
+                <span class="history-bias ${biasClass}">${record.bias}</span>
+                <span class="history-result ${resultClass}">${resultText}</span>
+            </div>
+        `;
+    }).join('');
+}
+
+// ============================================
+// ============================================
+// EVENT LISTENERS
+// ============================================
+
+function setupEventListeners() {
+    // Main TF Block settings button
+    document.getElementById('mainBlockSettingsBtn')?.addEventListener('click', () => {
+        const settings = document.getElementById('mainBlockSettings');
+        if (settings) {
+            settings.style.display = settings.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+    
+    // Sidebar toggle
+    document.getElementById('sidebarToggle')?.addEventListener('click', openSidebar);
+    document.getElementById('sidebarClose')?.addEventListener('click', closeSidebar);
+    document.getElementById('sidebarOverlay')?.addEventListener('click', closeSidebar);
+    
+    // Coin search
+    const coinSearch = document.getElementById('coinSearch');
+    if (coinSearch) {
+        coinSearch.addEventListener('input', (e) => filterCoins(e.target.value));
+    }
+    
+    // Chart options - indicator toggles in TF settings
+    ['showChartVolume', 'showChartMA', 'showChartEMA', 'showChartVWAP', 'showChartRSI', 'showChartMACD', 'showChartSR', 'showRSIDivergence', 'showFVG'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', (e) => {
+            state.settings[id] = e.target.checked;
+            saveSettings();
+            renderTimeframeRows();
+        });
+    });
+    
+    // Volume type selector in TF settings
+    document.getElementById('volumeTypeSelect')?.addEventListener('change', (e) => {
+        state.settings.volumeType = e.target.value;
+        saveSettings();
+        renderTimeframeRows();
+    });
+    
+    // Line color pickers
+    ['srSupportColor', 'srResistanceColor', 'fvgBullColor', 'fvgBearColor'].forEach(id => {
+        document.getElementById(id)?.addEventListener('input', (e) => {
+            state.settings[id] = e.target.value;
+            saveSettings();
+            renderTimeframeRows();
+        });
+    });
+    
+    // MA/EMA line builders (modern period + color + add/remove)
+    const defaultMaColors = ['#3b82f6', '#06b6d4', '#0ea5e9', '#14b8a6'];
+    const defaultEmaColors = ['#f59e0b', '#f97316', '#ef4444', '#ec4899'];
+    const defaultRsiColors = ['#a855f7', '#d946ef', '#8b5cf6', '#6366f1'];
+    
+    function renderMaBuilder() {
+        const container = document.getElementById('maLinesBuilder');
+        if (!container) return;
+        const lines = state.settings.maLines || [20];
+        const colors = state.settings.maColors || defaultMaColors.slice(0, lines.length);
+        container.innerHTML = lines.map((period, i) => `
+            <div class="ma-line-row">
+                <input type="number" class="ma-period" data-type="ma" data-idx="${i}" value="${period}" min="1" max="500" title="Period">
+                <input type="color" class="ma-color" data-type="ma" data-idx="${i}" value="${colors[i] || defaultMaColors[i % defaultMaColors.length]}" title="Color">
+                ${lines.length > 1 ? `<button class="ma-line-remove" data-type="ma" data-idx="${i}" title="Remove">✕</button>` : ''}
+            </div>
+        `).join('');
+        container.querySelectorAll('.ma-period').forEach(el => el.addEventListener('change', onMaLineChange));
+        container.querySelectorAll('.ma-color').forEach(el => el.addEventListener('input', onMaColorChange));
+        container.querySelectorAll('.ma-line-remove').forEach(el => el.addEventListener('click', onMaLineRemove));
+    }
+    
+    function renderEmaBuilder() {
+        const container = document.getElementById('emaLinesBuilder');
+        if (!container) return;
+        const lines = state.settings.emaLines || [21];
+        const colors = state.settings.emaColors || defaultEmaColors.slice(0, lines.length);
+        container.innerHTML = lines.map((period, i) => `
+            <div class="ma-line-row">
+                <input type="number" class="ma-period" data-type="ema" data-idx="${i}" value="${period}" min="1" max="500" title="Period">
+                <input type="color" class="ma-color" data-type="ema" data-idx="${i}" value="${colors[i] || defaultEmaColors[i % defaultEmaColors.length]}" title="Color">
+                ${lines.length > 1 ? `<button class="ma-line-remove" data-type="ema" data-idx="${i}" title="Remove">✕</button>` : ''}
+            </div>
+        `).join('');
+        container.querySelectorAll('.ma-period').forEach(el => el.addEventListener('change', onMaLineChange));
+        container.querySelectorAll('.ma-color').forEach(el => el.addEventListener('input', onMaColorChange));
+        container.querySelectorAll('.ma-line-remove').forEach(el => el.addEventListener('click', onMaLineRemove));
+    }
+    
+    function renderRsiBuilder() {
+        const container = document.getElementById('rsiLinesBuilder');
+        if (!container) return;
+        const lines = state.settings.rsiLines || [14];
+        const colors = state.settings.rsiColors || defaultRsiColors.slice(0, lines.length);
+        container.innerHTML = lines.map((period, i) => `
+            <div class="ma-line-row">
+                <input type="number" class="ma-period" data-type="rsi" data-idx="${i}" value="${period}" min="2" max="100" title="Period">
+                <input type="color" class="ma-color" data-type="rsi" data-idx="${i}" value="${colors[i] || defaultRsiColors[i % defaultRsiColors.length]}" title="Color">
+                ${lines.length > 1 ? `<button class="ma-line-remove" data-type="rsi" data-idx="${i}" title="Remove">✕</button>` : ''}
+            </div>
+        `).join('');
+        container.querySelectorAll('.ma-period').forEach(el => el.addEventListener('change', onMaLineChange));
+        container.querySelectorAll('.ma-color').forEach(el => el.addEventListener('input', onMaColorChange));
+        container.querySelectorAll('.ma-line-remove').forEach(el => el.addEventListener('click', onMaLineRemove));
+    }
+    
+    function onMaLineChange(e) {
+        const type = e.target.dataset.type;
+        const idx = parseInt(e.target.dataset.idx);
+        const val = parseInt(e.target.value);
+        if (isNaN(val) || val < 1 || val > 500) return;
+        const key = type === 'ma' ? 'maLines' : type === 'ema' ? 'emaLines' : 'rsiLines';
+        state.settings[key][idx] = val;
+        saveSettings();
+        renderTimeframeRows();
+    }
+    
+    function onMaColorChange(e) {
+        const type = e.target.dataset.type;
+        const idx = parseInt(e.target.dataset.idx);
+        const key = type === 'ma' ? 'maColors' : type === 'ema' ? 'emaColors' : 'rsiColors';
+        const defaults = type === 'ma' ? defaultMaColors : type === 'ema' ? defaultEmaColors : defaultRsiColors;
+        if (!state.settings[key]) state.settings[key] = [...defaults];
+        state.settings[key][idx] = e.target.value;
+        saveSettings();
+        renderTimeframeRows();
+    }
+    
+    function onMaLineRemove(e) {
+        const type = e.target.dataset.type;
+        const idx = parseInt(e.target.dataset.idx);
+        const linesKey = type === 'ma' ? 'maLines' : type === 'ema' ? 'emaLines' : 'rsiLines';
+        const colorsKey = type === 'ma' ? 'maColors' : type === 'ema' ? 'emaColors' : 'rsiColors';
+        state.settings[linesKey].splice(idx, 1);
+        if (state.settings[colorsKey]) state.settings[colorsKey].splice(idx, 1);
+        saveSettings();
+        if (type === 'ma') renderMaBuilder();
+        else if (type === 'ema') renderEmaBuilder();
+        else renderRsiBuilder();
+        renderTimeframeRows();
+    }
+    
+    document.getElementById('maAddBtn')?.addEventListener('click', () => {
+        if (!state.settings.maLines) state.settings.maLines = [20];
+        if (!state.settings.maColors) state.settings.maColors = [...defaultMaColors.slice(0, state.settings.maLines.length)];
+        const nextPeriod = state.settings.maLines.length === 0 ? 20 : 50;
+        state.settings.maLines.push(nextPeriod);
+        state.settings.maColors.push(defaultMaColors[state.settings.maLines.length - 1 % defaultMaColors.length] || '#3b82f6');
+        saveSettings();
+        renderMaBuilder();
+        renderTimeframeRows();
+    });
+    
+    document.getElementById('emaAddBtn')?.addEventListener('click', () => {
+        if (!state.settings.emaLines) state.settings.emaLines = [21];
+        if (!state.settings.emaColors) state.settings.emaColors = [...defaultEmaColors.slice(0, state.settings.emaLines.length)];
+        const nextPeriod = state.settings.emaLines.length === 0 ? 21 : 50;
+        state.settings.emaLines.push(nextPeriod);
+        state.settings.emaColors.push(defaultEmaColors[state.settings.emaLines.length - 1 % defaultEmaColors.length] || '#f59e0b');
+        saveSettings();
+        renderEmaBuilder();
+        renderTimeframeRows();
+    });
+    
+    document.getElementById('rsiAddBtn')?.addEventListener('click', () => {
+        if (!state.settings.rsiLines) state.settings.rsiLines = [14];
+        if (!state.settings.rsiColors) state.settings.rsiColors = [...defaultRsiColors.slice(0, state.settings.rsiLines.length)];
+        const nextPeriod = state.settings.rsiLines.length === 0 ? 14 : 7;
+        state.settings.rsiLines.push(nextPeriod);
+        state.settings.rsiColors.push(defaultRsiColors[state.settings.rsiLines.length - 1 % defaultRsiColors.length] || '#a855f7');
+        saveSettings();
+        renderRsiBuilder();
+        renderTimeframeRows();
+    });
+    
+    // Initialize builders
+    renderMaBuilder();
+    renderEmaBuilder();
+    renderRsiBuilder();
+    
+    // Pattern toggle checkboxes
+    const patternMap = {
+        'patternDoji': 'doji',
+        'patternHammer': 'hammer',
+        'patternInvHammer': 'invHammer',
+        'patternHangingMan': 'hangingMan',
+        'patternShootStar': 'shootStar',
+        'patternMarubozu': 'marubozu',
+        'patternSpinTop': 'spinTop',
+        'patternBullEngulf': 'bullEngulf',
+        'patternBearEngulf': 'bearEngulf',
+        'patternBullHarami': 'bullHarami',
+        'patternBearHarami': 'bearHarami',
+        'patternPiercing': 'piercing',
+        'patternDarkCloud': 'darkCloud',
+        'patternTweezTop': 'tweezTop',
+        'patternTweezBot': 'tweezBot',
+        'patternMorningStar': 'morningStar',
+        'patternEveningStar': 'eveningStar',
+        'pattern3Soldiers': 'threeSoldiers',
+        'pattern3Crows': 'threeCrows'
+    };
+    
+    // Ensure patterns object exists
+    if (!state.settings.patterns) state.settings.patterns = {};
+    
+    Object.entries(patternMap).forEach(([elId, key]) => {
+        const el = document.getElementById(elId);
+        if (el) {
+            // Load saved setting
+            el.checked = state.settings.patterns[key] !== false;
+            // Add change listener
+            el.addEventListener('change', (e) => {
+                state.settings.patterns[key] = e.target.checked;
+                saveSettings();
+                renderTimeframeRows();
+            });
+        }
+    });
+    
+    // Select all / Deselect all patterns
+    document.getElementById('selectAllPatterns')?.addEventListener('click', () => {
+        Object.values(patternMap).forEach(key => {
+            state.settings.patterns[key] = true;
+        });
+        Object.keys(patternMap).forEach(elId => {
+            const el = document.getElementById(elId);
+            if (el) el.checked = true;
+        });
+        saveSettings();
+        renderTimeframeRows();
+    });
+    
+    document.getElementById('deselectAllPatterns')?.addEventListener('click', () => {
+        Object.values(patternMap).forEach(key => {
+            state.settings.patterns[key] = false;
+        });
+        Object.keys(patternMap).forEach(elId => {
+            const el = document.getElementById(elId);
+            if (el) el.checked = false;
+        });
+        saveSettings();
+        renderTimeframeRows();
+    });
+    
+    // Coin comparison slots
+    initCoinComparisonPanel();
+    
+    // TF Settings toggle (inline settings in TF card)
+    document.getElementById('tfSettingsBtn')?.addEventListener('click', () => {
+        const tfSettings = document.getElementById('tfSettings');
+        if (tfSettings) {
+            tfSettings.style.display = tfSettings.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+    
+    // Confluence settings toggle (inline settings in confluence card)
+    document.getElementById('confluenceSettingsBtn')?.addEventListener('click', () => {
+        const confSettings = document.getElementById('confluenceSettings');
+        if (confSettings) {
+            confSettings.style.display = confSettings.style.display === 'none' ? 'block' : 'none';
+        }
+    });
+    
+    // Inline settings - auto-save on change
+    // Alert settings
+    document.getElementById('alertSeconds')?.addEventListener('change', (e) => {
+        state.settings.alertSeconds = parseInt(e.target.value);
+        saveSettings();
+    });
+    
+    document.getElementById('minConfluence')?.addEventListener('change', (e) => {
+        state.settings.minConfluence = parseInt(e.target.value);
+        saveSettings();
+    });
+    
+    document.getElementById('enableSound')?.addEventListener('change', (e) => {
+        state.settings.enableSound = e.target.checked;
+        saveSettings();
+    });
+    
+    // Signal notification settings
+    document.getElementById('enableSignalSound')?.addEventListener('change', (e) => {
+        state.settings.enableSignalSound = e.target.checked;
+        saveSettings();
+    });
+    
+    document.getElementById('enableSignalPopup')?.addEventListener('change', (e) => {
+        state.settings.enableSignalPopup = e.target.checked;
+        saveSettings();
+    });
+    
+    document.getElementById('signalCooldown')?.addEventListener('change', (e) => {
+        const ms = parseInt(e.target.value) * 1000;
+        state.settings.signalCooldownMs = ms;
+        state.signalState.cooldownMs = ms;
+        saveSettings();
+    });
+    
+    // Confluence settings
+    document.getElementById('weightMethod')?.addEventListener('change', (e) => {
+        state.settings.weightMethod = e.target.value;
+        saveSettings();
+        calculateConfluence();
+    });
+    
+    ['useStrengthMod', 'useVolumeMod', 'useIndicatorMod'].forEach(id => {
+        document.getElementById(id)?.addEventListener('change', (e) => {
+            state.settings[id] = e.target.checked;
+            saveSettings();
+            calculateConfluence();
+        });
+    });
+    
+    // Chart indicator toggles (merged - controls both chart panel and card badges)
+    ['showPriceInfo', 'showTimers', 'showConfluenceBar'].forEach(id => {
+        document.getElementById(id)?.addEventListener('change', (e) => {
+            state.settings[id] = e.target.checked;
+            saveSettings();
+            renderTimeframeRows();
+            redrawAddedCoinCharts();
+        });
+    });
+    
+    // Market signal badge toggles - re-render cards when toggled
+    const badgeIds = ['badgeLowVol','badgeHighVol','badgeVolSpike','badgeMACDUp','badgeMACDDown','badgeMACDCrossUp','badgeMACDCrossDown','badgeRejHi','badgeRejLo','badgeOB','badgeOS','badgeExtOB','badgeExtOS','badgeIndecision','badgeBigBody','badgeEngulf'];
+    badgeIds.forEach(id => {
+        document.getElementById(id)?.addEventListener('change', () => {
+            renderTimeframeRows();
+        });
+    });
+    
+    // Select All / Deselect All for market signals
+    document.getElementById('selectAllSignals')?.addEventListener('click', () => {
+        badgeIds.forEach(id => { const el = document.getElementById(id); if (el) el.checked = true; });
+        renderTimeframeRows();
+    });
+    document.getElementById('deselectAllSignals')?.addEventListener('click', () => {
+        badgeIds.forEach(id => { const el = document.getElementById(id); if (el) el.checked = false; });
+        renderTimeframeRows();
+    });
+    
+    // Tip Jar modal
+    document.getElementById('tipJarBtn')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        document.getElementById('tipJarModal').classList.add('active');
+    });
+    
+    document.getElementById('closeTipJar')?.addEventListener('click', () => {
+        document.getElementById('tipJarModal').classList.remove('active');
+    });
+    
+    document.getElementById('tipJarModal')?.addEventListener('click', (e) => {
+        if (e.target.id === 'tipJarModal') {
+            document.getElementById('tipJarModal').classList.remove('active');
+        }
+    });
+    
+    // Copy crypto address buttons
+    document.querySelectorAll('.btn-copy').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const targetId = btn.dataset.copy;
+            const code = document.getElementById(targetId);
+            if (code) {
+                navigator.clipboard.writeText(code.textContent);
+                btn.textContent = '✓';
+                setTimeout(() => btn.textContent = '📋', 2000);
+            }
+        });
+    });
+    
+    // Sidebar tabs (All Coins / Watchlist)
+    document.querySelectorAll('.sidebar-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            const tabId = tab.dataset.tab;
+            document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            
+            if (tabId === 'watchlist') {
+                document.getElementById('coinsList').style.display = 'none';
+                document.getElementById('watchlistList').style.display = 'block';
+                renderWatchlist();
+            } else {
+                document.getElementById('coinsList').style.display = 'block';
+                document.getElementById('watchlistList').style.display = 'none';
+            }
+        });
+    });
+    
+    // Confluence history toggle
+    document.getElementById('historyToggle')?.addEventListener('click', () => {
+        const historySection = document.getElementById('confluenceHistory');
+        historySection?.classList.toggle('collapsed');
+    });
+    
+    // Compare All Methods toggle
+    document.getElementById('methodsCompareToggle')?.addEventListener('click', () => {
+        const body = document.getElementById('methodsCompareBody');
+        if (body) body.style.display = body.style.display === 'none' ? 'block' : 'none';
+        const icon = document.querySelector('#methodsCompareToggle .methods-compare-icon');
+        if (icon) icon.textContent = body?.style.display === 'none' ? '▼' : '▲';
+    });
+    
+    // Card settings button toggle visual state
+    document.getElementById('tfSettingsBtn')?.addEventListener('click', function() {
+        this.classList.toggle('active');
+    });
+    
+    document.getElementById('confluenceSettingsBtn')?.addEventListener('click', function() {
+        this.classList.toggle('active');
+    });
+    
+    // View mode select (clear/advanced)
+    document.getElementById('viewModeSelect')?.addEventListener('change', (e) => {
+        state.settings.viewMode = e.target.value;
+        if (e.target.value === 'clear') {
+            document.body.classList.add('clear-mode');
+        } else {
+            document.body.classList.remove('clear-mode');
+        }
+        saveSettings();
+        renderTimeframeRows();
+    });
+    
+    // Candle popup type select (hover-tab/click-popup)
+    document.getElementById('candlePopupType')?.addEventListener('change', (e) => {
+        state.settings.candlePopupType = e.target.value;
+        saveSettings();
+    });
+    
+    // Theme select in settings
+    document.getElementById('themeSelect')?.addEventListener('change', (e) => {
+        state.settings.theme = e.target.value;
+        applyTheme(state.settings.theme);
+        saveSettings();
+        renderTimeframeRows();
+        redrawAddedCoinCharts();
+    });
+    
+    // Multi-coin view toggle
+    document.getElementById('multiCoinBtn')?.addEventListener('click', () => {
+        toggleMultiCoinView();
+    });
+    
+    document.getElementById('addCoinPanel')?.addEventListener('click', () => {
+        addCoinPanel();
+    });
+    
+    document.getElementById('closeMultiView')?.addEventListener('click', () => {
+        closeMultiCoinView();
+    });
+    
+    // Theme toggle button in header
+    document.getElementById('themeToggle')?.addEventListener('click', () => {
+        cycleTheme();
+    });
+    
+    // Window resize
+    let resizeTimer;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            renderTimeframeRows();
+            if (state.multiCoinMode) {
+                updateMultiCoinPanels();
+            }
+            redrawAddedCoinCharts();
+        }, 200);
+    });
+    
+    // Clean up WebSocket on page unload
+    window.addEventListener('beforeunload', () => wsDisconnect());
+}
+
+// Watchlist functions
+function getWatchlist() {
+    const saved = localStorage.getItem('mtfcm_watchlist');
+    try { return saved ? JSON.parse(saved) : []; } catch(e) { return []; }
+}
+
+function saveWatchlist(watchlist) {
+    localStorage.setItem('mtfcm_watchlist', JSON.stringify(watchlist));
+}
+
+function toggleWatchlist(symbol) {
+    let watchlist = getWatchlist();
+    if (watchlist.includes(symbol)) {
+        watchlist = watchlist.filter(s => s !== symbol);
+    } else {
+        watchlist.push(symbol);
+    }
+    saveWatchlist(watchlist);
+    renderCoinsSidebar();
+    renderWatchlist();
+}
+
+function renderWatchlist() {
+    const container = document.getElementById('watchlistList');
+    const watchlist = getWatchlist();
+    
+    if (watchlist.length === 0) {
+        container.innerHTML = `
+            <div class="watchlist-empty">
+                <p>No coins in watchlist</p>
+                <small>Click ⭐ on any coin to add</small>
+            </div>
+        `;
+        return;
+    }
+    
+    container.innerHTML = watchlist.map(symbol => {
+        const coin = state.coins.find(c => c.symbol === symbol);
+        if (!coin) return '';
+        
+        const data = state.coinData[symbol] || {};
+        const confluenceScore = data.confluenceScore || 50;
+        const bias = confluenceScore >= 60 ? '🟢' : confluenceScore <= 40 ? '🔴' : '🟡';
+        
+        return `
+            <div class="watchlist-item" data-symbol="${symbol}">
+                <img src="${coin.icon}" alt="${coin.shortName}" width="24" height="24" onerror="this.style.display='none'">
+                <div class="watchlist-item-info">
+                    <div class="watchlist-item-name">${coin.shortName}</div>
+                    <div class="watchlist-item-price">$${(data.price || 0).toFixed(coin.decimals || 2)}</div>
+                </div>
+                <div class="watchlist-confluence">
+                    <div class="watchlist-confluence-marker" style="left: ${confluenceScore}%"></div>
+                </div>
+                <span class="watchlist-bias">${bias}</span>
+            </div>
+        `;
+    }).join('');
+    
+    // Add click handlers
+    container.querySelectorAll('.watchlist-item').forEach(item => {
+        item.addEventListener('click', () => {
+            selectCoin(item.dataset.symbol);
+            closeSidebar();
+        });
+    });
+}
+
+function loadSettingsToForm() {
+    // Alert settings
+    const alertSeconds = document.getElementById('alertSeconds');
+    const minConfluence = document.getElementById('minConfluence');
+    const enableSound = document.getElementById('enableSound');
+    
+    if (alertSeconds) alertSeconds.value = state.settings.alertSeconds;
+    if (minConfluence) minConfluence.value = state.settings.minConfluence;
+    if (enableSound) enableSound.checked = state.settings.enableSound;
+    
+    // Confluence settings
+    const weightMethod = document.getElementById('weightMethod');
+    const useStrengthMod = document.getElementById('useStrengthMod');
+    const useVolumeMod = document.getElementById('useVolumeMod');
+    const useIndicatorMod = document.getElementById('useIndicatorMod');
+    
+    if (weightMethod) weightMethod.value = state.settings.weightMethod;
+    if (useStrengthMod) useStrengthMod.checked = state.settings.useStrengthMod;
+    if (useVolumeMod) useVolumeMod.checked = state.settings.useVolumeMod;
+    if (useIndicatorMod) useIndicatorMod.checked = state.settings.useIndicatorMod;
+    
+    // Display settings
+    const showWarnings = document.getElementById('showWarnings');
+    if (showWarnings) showWarnings.checked = state.settings.showWarnings;
+    
+    // Theme select
+    const themeSelect = document.getElementById('themeSelect');
+    if (themeSelect) themeSelect.value = state.settings.theme || 'dark';
+    
+    // View mode toggle
+    const viewModeToggle = document.getElementById('viewModeToggle');
+    if (viewModeToggle) viewModeToggle.checked = state.settings.advancedMode !== false;
+}
+
+function saveSettingsFromForm() {
+    state.settings.alertSeconds = parseInt(document.getElementById('alertSeconds').value);
+    state.settings.minConfluence = parseInt(document.getElementById('minConfluence').value);
+    state.settings.enableSound = document.getElementById('enableSound').checked;
+    state.settings.weightMethod = document.getElementById('weightMethod').value;
+    state.settings.useStrengthMod = document.getElementById('useStrengthMod').checked;
+    state.settings.useVolumeMod = document.getElementById('useVolumeMod').checked;
+    state.settings.useIndicatorMod = document.getElementById('useIndicatorMod').checked;
+    state.settings.showWarnings = document.getElementById('showWarnings')?.checked;
+    
+    saveSettings();
+}
+
+function loadIndicatorsToForm() {
+    const maLinesInput = document.getElementById('maLinesInput');
+    const emaLinesInput = document.getElementById('emaLinesInput');
+    const rsiLinesInput = document.getElementById('rsiLinesInput');
+    
+    if (maLinesInput) maLinesInput.value = (state.settings.maLines || [20]).join(', ');
+    if (emaLinesInput) emaLinesInput.value = (state.settings.emaLines || [21]).join(', ');
+    if (rsiLinesInput) rsiLinesInput.value = (state.settings.rsiLines || [14]).join(', ');
+    
+    // Checkboxes
+    const showVWAP = document.getElementById('showChartVWAPModal');
+    const showMACD = document.getElementById('showChartMACDModal');
+    const showPatterns = document.getElementById('showChartPatternsModal');
+    const showMarkers = document.getElementById('showChartMarkersModal');
+    const showVolume = document.getElementById('showChartVolumeModal');
+    const volumeType = document.getElementById('volumeTypeModal');
+    
+    if (showVWAP) showVWAP.checked = state.settings.showChartVWAP;
+    if (showMACD) showMACD.checked = state.settings.showChartMACD;
+    if (showPatterns) showPatterns.checked = state.settings.showChartPatterns !== false;
+    if (showMarkers) showMarkers.checked = state.settings.showChartMarkers !== false;
+    if (showVolume) showVolume.checked = state.settings.showChartVolume !== false;
+    if (volumeType) volumeType.value = state.settings.volumeType || 'buysell';
+}
+
+function saveIndicatorsFromForm() {
+    const maLinesInput = document.getElementById('maLinesInput');
+    const emaLinesInput = document.getElementById('emaLinesInput');
+    const rsiLinesInput = document.getElementById('rsiLinesInput');
+    
+    if (maLinesInput) {
+        const maLines = maLinesInput.value.split(',')
+            .map(s => parseInt(s.trim()))
+            .filter(n => !isNaN(n) && n > 0 && n <= 500);
+        state.settings.maLines = maLines.length > 0 ? maLines : [20];
+    }
+    
+    if (emaLinesInput) {
+        const emaLines = emaLinesInput.value.split(',')
+            .map(s => parseInt(s.trim()))
+            .filter(n => !isNaN(n) && n > 0 && n <= 500);
+        state.settings.emaLines = emaLines.length > 0 ? emaLines : [21];
+    }
+    
+    if (rsiLinesInput) {
+        const rsiLines = rsiLinesInput.value.split(',')
+            .map(s => parseInt(s.trim()))
+            .filter(n => !isNaN(n) && n > 0 && n <= 100);
+        state.settings.rsiLines = rsiLines.length > 0 ? rsiLines : [14];
+    }
+    
+    // Checkboxes
+    const showVWAP = document.getElementById('showChartVWAPModal');
+    const showMACD = document.getElementById('showChartMACDModal');
+    const showPatterns = document.getElementById('showChartPatternsModal');
+    const showMarkers = document.getElementById('showChartMarkersModal');
+    const showVolume = document.getElementById('showChartVolumeModal');
+    const volumeType = document.getElementById('volumeTypeModal');
+    
+    if (showVWAP) state.settings.showChartVWAP = showVWAP.checked;
+    if (showMACD) state.settings.showChartMACD = showMACD.checked;
+    if (showPatterns) state.settings.showChartPatterns = showPatterns.checked;
+    if (showMarkers) state.settings.showChartMarkers = showMarkers.checked;
+    if (showVolume) state.settings.showChartVolume = showVolume.checked;
+    if (volumeType) state.settings.volumeType = volumeType.value;
+    
+    saveSettings();
+}
+
+// ============================================
+// MULTI-COIN VIEW
+// ============================================
+
+state.multiCoinMode = false;
+state.coinPanels = []; // Array of { id, symbol, timeframes, data }
+
+function toggleMultiCoinView() {
+    state.multiCoinMode = !state.multiCoinMode;
+    
+    const multiContainer = document.getElementById('multiCoinContainer');
+    const singleView = document.getElementById('singleCoinView');
+    const btn = document.getElementById('multiCoinBtn');
+    
+    if (state.multiCoinMode) {
+        multiContainer.style.display = 'flex';
+        singleView.style.display = 'none';
+        btn.classList.add('active');
+        
+        // Initialize with current coin if no panels exist
+        if (state.coinPanels.length === 0 && state.currentCoin) {
+            addCoinPanel(state.currentCoin.symbol);
+        }
+        
+        renderMultiCoinPanels();
+    } else {
+        closeMultiCoinView();
+    }
+}
+
+function closeMultiCoinView() {
+    state.multiCoinMode = false;
+    
+    const multiContainer = document.getElementById('multiCoinContainer');
+    const singleView = document.getElementById('singleCoinView');
+    const btn = document.getElementById('multiCoinBtn');
+    
+    multiContainer.style.display = 'none';
+    singleView.style.display = 'block';
+    btn.classList.remove('active');
+}
+
+function addCoinPanel(symbol = null) {
+    if (state.coinPanels.length >= 3) {
+        showKeyboardHint('Maximum 4 coins');
+        return;
+    }
+    
+    const panelId = 'panel-' + Date.now();
+    const coinSymbol = symbol || (state.coins[0]?.symbol);
+    
+    // Get default enabled timeframes
+    const enabledTFs = state.timeframes.filter(tf => tf.enabled).map(tf => tf.id);
+    
+    state.coinPanels.push({
+        id: panelId,
+        symbol: coinSymbol,
+        timeframes: enabledTFs.length > 0 ? enabledTFs : ['5m', '15m', '1h'],
+        data: {},
+        candles: {}
+    });
+    
+    renderMultiCoinPanels();
+    fetchPanelData(panelId);
+}
+
+function removeCoinPanel(panelId) {
+    state.coinPanels = state.coinPanels.filter(p => p.id !== panelId);
+    
+    if (state.coinPanels.length === 0) {
+        closeMultiCoinView();
+    } else {
+        renderMultiCoinPanels();
+    }
+}
+
+function renderMultiCoinPanels() {
+    const container = document.getElementById('multiCoinPanels');
+    const panelCount = state.coinPanels.length;
+    
+    // Set grid class
+    container.className = `multi-coin-panels panels-${panelCount}`;
+    
+    container.innerHTML = state.coinPanels.map(panel => {
+        const coin = state.coins.find(c => c.symbol === panel.symbol);
+        const coinData = state.coinData[panel.symbol] || {};
+        const change = coinData.change || 0;
+        const changeClass = change >= 0 ? 'positive' : 'negative';
+        
+        // Build coin selector options
+        const coinOptions = state.coins.map(c => 
+            `<option value="${c.symbol}" ${c.symbol === panel.symbol ? 'selected' : ''}>${c.shortName}</option>`
+        ).join('');
+        
+        // Build timeframe toggles
+        const tfToggles = state.timeframes.map(tf => {
+            const isActive = panel.timeframes.includes(tf.id);
+            const tfData = panel.data[tf.id];
+            const dirClass = tfData ? (tfData.isBullish ? 'bullish' : 'bearish') : '';
+            return `<button class="coin-panel-tf-btn ${isActive ? 'active' : ''} ${dirClass}" 
+                            data-panel="${panel.id}" data-tf="${tf.id}">${tf.label}</button>`;
+        }).join('');
+        
+        // Calculate panel confluence
+        let panelConfluence = 50;
+        let bullCount = 0, bearCount = 0;
+        panel.timeframes.forEach(tfId => {
+            const tfData = panel.data[tfId];
+            if (tfData) {
+                if (tfData.isBullish) bullCount++;
+                else bearCount++;
+            }
+        });
+        if (bullCount + bearCount > 0) {
+            panelConfluence = (bullCount / (bullCount + bearCount)) * 100;
+        }
+        
+        // Build mini charts
+        const chartsHtml = panel.timeframes.map(tfId => {
+            const tf = state.timeframes.find(t => t.id === tfId);
+            const secondsToClose = getSecondsToClose(tf);
+            return `
+                <div class="coin-panel-chart-row">
+                    <div class="coin-panel-chart-header">
+                        <span class="coin-panel-chart-tf">${tf.label}</span>
+                        <span class="coin-panel-chart-timer">${formatTime(secondsToClose)}</span>
+                    </div>
+                    <canvas class="coin-panel-chart-canvas" id="panel-chart-${panel.id}-${tfId}"></canvas>
+                </div>
+            `;
+        }).join('');
+        
+        return `
+            <div class="coin-panel" id="${panel.id}">
+                <div class="coin-panel-header">
+                    <div class="coin-panel-select">
+                        <img src="${coin?.icon || ''}" alt="" onerror="this.style.display='none'">
+                        <select data-panel="${panel.id}" class="panel-coin-select">
+                            ${coinOptions}
+                        </select>
+                        <span class="coin-panel-price">$${(coinData.price || 0).toFixed(coin?.decimals || 2)}</span>
+                        <span class="coin-panel-change ${changeClass}">${change >= 0 ? '+' : ''}${change.toFixed(2)}%</span>
+                    </div>
+                    <div class="coin-panel-actions">
+                        <button onclick="removeCoinPanel('${panel.id}')" title="Remove">✕</button>
+                    </div>
+                </div>
+                <div class="coin-panel-body">
+                    <div class="coin-panel-confluence">
+                        <div class="coin-panel-confluence-bar">
+                            <div class="coin-panel-confluence-marker" style="left: ${panelConfluence}%"></div>
+                        </div>
+                        <span class="coin-panel-confluence-value" style="color: ${panelConfluence >= 60 ? 'var(--bull-color)' : panelConfluence <= 40 ? 'var(--bear-color)' : 'var(--neutral-color)'}">
+                            ${panelConfluence.toFixed(0)}%
+                        </span>
+                    </div>
+                    <div class="coin-panel-tf-toggles">
+                        ${tfToggles}
+                    </div>
+                    <div class="coin-panel-charts">
+                        ${chartsHtml}
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    // Add event listeners for coin selects
+    container.querySelectorAll('.panel-coin-select').forEach(select => {
+        select.addEventListener('change', (e) => {
+            const panelId = e.target.dataset.panel;
+            const newSymbol = e.target.value;
+            changePanelCoin(panelId, newSymbol);
+        });
+    });
+    
+    // Add event listeners for TF toggles
+    container.querySelectorAll('.coin-panel-tf-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const panelId = e.target.dataset.panel;
+            const tfId = e.target.dataset.tf;
+            togglePanelTimeframe(panelId, tfId);
+        });
+    });
+    
+    // Draw charts after a small delay
+    setTimeout(() => {
+        state.coinPanels.forEach(panel => {
+            panel.timeframes.forEach(tfId => {
+                drawPanelChart(panel.id, tfId);
+            });
+        });
+    }, 50);
+}
+
+function changePanelCoin(panelId, newSymbol) {
+    const panel = state.coinPanels.find(p => p.id === panelId);
+    if (panel) {
+        panel.symbol = newSymbol;
+        panel.data = {};
+        panel.candles = {};
+        fetchPanelData(panelId);
+        renderMultiCoinPanels();
+    }
+}
+
+function togglePanelTimeframe(panelId, tfId) {
+    const panel = state.coinPanels.find(p => p.id === panelId);
+    if (!panel) return;
+    
+    if (panel.timeframes.includes(tfId)) {
+        // Remove if more than 1 timeframe
+        if (panel.timeframes.length > 1) {
+            panel.timeframes = panel.timeframes.filter(t => t !== tfId);
+        }
+    } else {
+        panel.timeframes.push(tfId);
+        // Fetch data for new timeframe
+        fetchPanelTimeframeData(panelId, tfId);
+    }
+    
+    renderMultiCoinPanels();
+}
+
+async function fetchPanelData(panelId) {
+    const panel = state.coinPanels.find(p => p.id === panelId);
+    if (!panel) return;
+    
+    for (const tfId of panel.timeframes) {
+        await fetchPanelTimeframeData(panelId, tfId);
+    }
+    
+    renderMultiCoinPanels();
+}
+
+async function fetchPanelTimeframeData(panelId, tfId) {
+    const panel = state.coinPanels.find(p => p.id === panelId);
+    if (!panel) return;
+    
+    try {
+        const response = await fetch(
+            `${BINANCE_API}/klines?symbol=${panel.symbol}&interval=${tfId}&limit=${CANDLE_LIMIT}`
+        );
+        const data = await response.json();
+        
+        const candles = data.map(candle => ({
+            openTime: candle[0],
+            open: parseFloat(candle[1]),
+            high: parseFloat(candle[2]),
+            low: parseFloat(candle[3]),
+            close: parseFloat(candle[4]),
+            volume: parseFloat(candle[5]),
+            closeTime: candle[6]
+        }));
+        
+        panel.candles[tfId] = candles;
+        panel.data[tfId] = analyzeCandles(candles, tfId);
+        
+    } catch (e) {
+        console.error(`Error fetching panel data for ${panel.symbol} ${tfId}:`, e);
+    }
+}
+
+function drawPanelChart(panelId, tfId) {
+    const panel = state.coinPanels.find(p => p.id === panelId);
+    if (!panel || !panel.candles[tfId]) return;
+    
+    const canvasId = `panel-chart-${panelId}-${tfId}`;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    
+    const ctx = canvas.getContext('2d');
+    const rect = canvas.parentElement.getBoundingClientRect();
+    
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = 60 * dpr;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = '60px';
+    ctx.scale(dpr, dpr);
+    
+    const width = rect.width;
+    const height = 60;
+    
+    const candles = panel.candles[tfId];
+    const displayCandles = candles.slice(-30); // Show last 30 candles
+    
+    if (displayCandles.length === 0) return;
+    
+    const prices = displayCandles.flatMap(c => [c.high, c.low]);
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const priceRange = maxPrice - minPrice || 1;
+    
+    const padding = { top: 2, right: 2, bottom: 2, left: 2 };
+    const chartWidth = width - padding.left - padding.right;
+    const chartHeight = height - padding.top - padding.bottom;
+    
+    const scaleY = (price) => padding.top + chartHeight - ((price - minPrice) / priceRange) * chartHeight;
+    
+    const candleSpacing = chartWidth / displayCandles.length;
+    const candleWidth = Math.max(1, candleSpacing * 0.7);
+    
+    // Theme colors
+    const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const isDark = theme === 'dark';
+    const isColorful = theme === 'colorful';
+    const bgColor = isDark ? '#1e1e42' : (isColorful ? '#faf5ff' : '#fafbfc');
+    const bullColor = isDark ? '#34d399' : '#059669';
+    const bearColor = isDark ? '#fb7185' : '#e11d48';
+    
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, width, height);
+    
+    // Draw candles
+    displayCandles.forEach((candle, i) => {
+        const x = padding.left + i * candleSpacing + candleSpacing / 2;
+        const isBull = candle.close >= candle.open;
+        const openY = scaleY(candle.open);
+        const closeY = scaleY(candle.close);
+        const highY = scaleY(candle.high);
+        const lowY = scaleY(candle.low);
+        
+        ctx.strokeStyle = isBull ? bullColor : bearColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, highY);
+        ctx.lineTo(x, lowY);
+        ctx.stroke();
+        
+        ctx.fillStyle = isBull ? bullColor : bearColor;
+        const bodyTop = Math.min(openY, closeY);
+        const bodyHeight = Math.max(1, Math.abs(closeY - openY));
+        ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+    });
+}
+
+function updateMultiCoinPanels() {
+    if (!state.multiCoinMode) return;
+    
+    // Redraw all panel charts
+    state.coinPanels.forEach(panel => {
+        panel.timeframes.forEach(tfId => {
+            drawPanelChart(panel.id, tfId);
+        });
+    });
+}
+
+// Update multi-coin panels periodically
+setInterval(() => {
+    if (state.multiCoinMode) {
+        state.coinPanels.forEach(panel => {
+            fetchPanelData(panel.id);
+        });
+    }
+}, 10000);
+
+// ============================================
+// ADD COIN PANEL (Simple + Button Design)
+// ============================================
+
+state.addedCoins = []; // Array of added coin symbols (max 3)
+
+function initCoinComparisonPanel() {
+    const addCoinDD = document.getElementById('addCoinDropdown');
+    
+    if (addCoinDD) {
+        // Populate and setup fancy dropdown for add coin
+        const disabledSymbols = [state.currentCoin?.symbol, ...state.addedCoins].filter(Boolean);
+        populateCoinDropdownList(addCoinDD.querySelector('.coin-dropdown-list'), null, disabledSymbols, true);
+        
+        setupCoinDropdown(addCoinDD, (symbol) => {
+            addCoinToComparison(symbol);
+        });
+    }
+    
+    // Load saved added coins
+    if (state.settings.comparisonCoins && state.settings.comparisonCoins.length > 0) {
+        // In bridge mode, filter out any non-halal saved coins
+        var validCoins = state.settings.comparisonCoins;
+        if (IS_HAIAL_BRIDGE) {
+            var validSymbols = state.coins.map(function(c) { return c.symbol; });
+            validCoins = validCoins.filter(function(sym) { return validSymbols.indexOf(sym) !== -1; });
+        }
+        state.addedCoins = [...validCoins].slice(0, 4);
+        
+        // Load per-coin confluence settings
+        try {
+            const savedCoinSettings = localStorage.getItem('mtfcm_addedCoinSettings');
+            if (savedCoinSettings) state.addedCoinSettings = JSON.parse(savedCoinSettings);
+        } catch(e) { /* ignore */ }
+        
+        renderAddedCoins();
+    }
+    
+    // Update + button visibility based on coin count
+    updateAddButtonVisibility();
+}
+
+function refreshAddCoinDropdown() {
+    const addCoinDD = document.getElementById('addCoinDropdown');
+    if (!addCoinDD) return;
+    const disabledSymbols = [state.currentCoin?.symbol, ...state.addedCoins].filter(Boolean);
+    populateCoinDropdownList(addCoinDD.querySelector('.coin-dropdown-list'), null, disabledSymbols, true);
+}
+
+function addCoinToComparison(symbol) {
+    if (state.addedCoins.length >= 3) {
+        showKeyboardHint('Maximum 4 coins');
+        return;
+    }
+    
+    if (state.addedCoins.includes(symbol)) return;
+    if (symbol === state.currentCoin?.symbol) return;
+    
+    // Haial bridge: ensure coin is in the filtered list
+    if (IS_HAIAL_BRIDGE && !state.coins.find(c => c.symbol === symbol)) {
+        showKeyboardHint('Coin not halal-approved');
+        return;
+    }
+    
+    state.addedCoins.push(symbol);
+    
+    // Save to settings
+    state.settings.comparisonCoins = [...state.addedCoins];
+    saveSettings();
+    
+    // Close dropdown
+    const dropdown = document.getElementById('addCoinDropdown');
+    if (dropdown) dropdown.classList.remove('open');
+    
+    // Render added coins
+    renderAddedCoins();
+    updateAddButtonVisibility();
+    refreshAddCoinDropdown();
+    // Reconnect WebSocket with new coin streams
+    setTimeout(() => wsConnect(), 500);
+}
+
+function removeAddedCoin(symbol) {
+    state.addedCoins = state.addedCoins.filter(s => s !== symbol);
+    
+    // Clean up state
+    if (state.addedCoinTfState) delete state.addedCoinTfState[symbol];
+    if (state.addedCoinSettings) delete state.addedCoinSettings[symbol];
+    if (state.addedCoinData) delete state.addedCoinData[symbol];
+    if (state.addedCoinCandles) {
+        Object.keys(state.addedCoinCandles).forEach(key => {
+            if (key.startsWith(symbol)) delete state.addedCoinCandles[key];
+        });
+    }
+    if (state.addedCoinConfluence) delete state.addedCoinConfluence[symbol];
+    if (state.addedCoinHistory) delete state.addedCoinHistory[symbol];
+    // Clean up chart state/data/patterns for added coin TF keys
+    Object.keys(state.data).forEach(key => { if (key.startsWith(symbol + '-')) delete state.data[key]; });
+    Object.keys(state.patterns).forEach(key => { if (key.startsWith(symbol + '-')) delete state.patterns[key]; });
+    Object.keys(state.chartStates).forEach(key => { if (key.startsWith(symbol + '-')) delete state.chartStates[key]; });
+    
+    // Save to settings
+    state.settings.comparisonCoins = [...state.addedCoins];
+    saveSettings();
+    
+    // Re-render
+    renderAddedCoins();
+    updateAddButtonVisibility();
+    refreshAddCoinDropdown();
+    // Reconnect WebSocket without removed coin streams
+    setTimeout(() => wsConnect(), 500);
+}
+
+function swapAddedCoin(oldSymbol, newSymbol) {
+    // Debounce rapid switches
+    if (state._swapDebounce) clearTimeout(state._swapDebounce);
+    state._swapDebounce = setTimeout(() => {
+        _doSwapAddedCoin(oldSymbol, newSymbol);
+    }, 300);
+}
+
+function _doSwapAddedCoin(oldSymbol, newSymbol) {
+    // Replace in addedCoins array
+    const idx = state.addedCoins.indexOf(oldSymbol);
+    if (idx === -1) return;
+    
+    state.addedCoins[idx] = newSymbol;
+    
+    // Clean up old coin state
+    if (state.addedCoinTfState) delete state.addedCoinTfState[oldSymbol];
+    if (state.addedCoinData) delete state.addedCoinData[oldSymbol];
+    if (state.addedCoinCandles) {
+        Object.keys(state.addedCoinCandles).forEach(key => {
+            if (key.startsWith(oldSymbol)) delete state.addedCoinCandles[key];
+        });
+    }
+    // Clean up chart state/data/patterns for old coin TF keys
+    Object.keys(state.data).forEach(key => { if (key.startsWith(oldSymbol + '-')) delete state.data[key]; });
+    Object.keys(state.patterns).forEach(key => { if (key.startsWith(oldSymbol + '-')) delete state.patterns[key]; });
+    Object.keys(state.chartStates).forEach(key => { if (key.startsWith(oldSymbol + '-')) delete state.chartStates[key]; });
+    
+    // Save to settings
+    state.settings.comparisonCoins = [...state.addedCoins];
+    saveSettings();
+    
+    // Re-render all added coins
+    renderAddedCoins();
+    updateAddButtonVisibility();
+}
+
+function updateAddButtonVisibility() {
+    const addBox = document.getElementById('addCoinBox');
+    if (addBox) {
+        addBox.style.display = state.addedCoins.length >= 3 ? 'none' : 'block';
+    }
+}
+
+function renderAddedCoins() {
+    const container = document.getElementById('addedTfBlocks');
+    if (!container) return;
+    
+    // Remove existing added blocks
+    container.innerHTML = '';
+    
+    state.addedCoins.forEach(symbol => {
+        const coin = state.coins.find(c => c.symbol === symbol);
+        if (!coin) return;
+        
+        const baseSymbol = symbol.replace('USDT', '');
+        
+        // Initialize added coin's TF state if not exists
+        if (!state.addedCoinTfState) state.addedCoinTfState = {};
+        if (!state.addedCoinTfState[symbol]) {
+            state.addedCoinTfState[symbol] = state.timeframes.map(tf => ({
+                id: tf.id,
+                label: tf.label,
+                enabled: tf.enabled
+            }));
+        }
+        
+        // Per-coin confluence settings (independent from main)
+        if (!state.addedCoinSettings) state.addedCoinSettings = {};
+        if (!state.addedCoinSettings[symbol]) {
+            state.addedCoinSettings[symbol] = {
+                weightMethod: state.settings.weightMethod || 'linear',
+                useStrengthMod: state.settings.useStrengthMod !== false,
+                useVolumeMod: state.settings.useVolumeMod !== false,
+                useIndicatorMod: state.settings.useIndicatorMod !== false
+            };
+        }
+        
+        // Build TF toggle buttons HTML using this coin's TF state
+        const tfTogglesHtml = state.addedCoinTfState[symbol].map(tf => {
+            const mainTf = state.timeframes.find(t => t.id === tf.id);
+            const secondsToClose = getSecondsToClose(mainTf);
+            return `
+                <div class="tf-toggle-btn ${tf.enabled ? 'active' : ''}" data-tf="${tf.id}" data-symbol="${symbol}">
+                    <span class="tf-toggle-label">${tf.label}</span>
+                    <span class="tf-toggle-timer">${formatTime(secondsToClose)}</span>
+                </div>
+            `;
+        }).join('');
+        
+        // Build fancy swap dropdown HTML (same as main coin)
+        const swapDDId = `coinSwapDD-${symbol}`;
+        const swapDropdownHtml = buildFancyDropdownHTML(swapDDId, symbol);
+        
+        // Create full TF block with ALL settings (clone of main)
+        const block = document.createElement('div');
+        block.className = 'tf-block added-tf-block';
+        block.dataset.symbol = symbol;
+        
+        block.innerHTML = `
+            <div class="tf-block-header">
+                <span class="tf-block-title">
+                    <div class="coin-swap-wrapper">
+                        ${swapDropdownHtml}
+                    </div>
+                    <span class="coin-price" id="blockPrice-${symbol}">Loading...</span>
+                </span>
+                <div class="tf-block-toggles-inline" id="blockToggles-${symbol}">
+                    ${tfTogglesHtml}
+                </div>
+                <div>
+                    <button class="btn btn-sm btn-card-settings" data-symbol="${symbol}" title="Settings">⚙️</button>
+                    <button class="tf-block-remove" onclick="removeAddedCoin('${symbol}')" title="Remove">✕</button>
+                </div>
+            </div>
+            <!-- FULL Settings (COMPLETE clone of main block) -->
+            <div class="tf-block-settings" id="blockSettings-${symbol}" style="display: none;">
+                <div class="card-settings-section">
+                    <span class="settings-section-label">🎨 Display</span>
+                    <div class="card-settings-row">
+                        <label>Display Mode</label>
+                        <select id="viewMode-${symbol}" class="input-sm">
+                            <option value="clear">Clear</option>
+                            <option value="advanced" selected>Advanced</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="card-settings-section">
+                    <span class="settings-section-label">📊 Chart Indicators</span>
+                    <div class="card-settings-row">
+                        <label>Overlays & Panels</label>
+                        <div class="modifier-toggles">
+                            <label class="mini-toggle"><input type="checkbox" id="showChartVolume-${symbol}" checked><span>Vol</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartRSI-${symbol}"><span>RSI</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showRSIDivergence-${symbol}" checked><span>Div</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartMACD-${symbol}"><span>MACD</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartMA-${symbol}"><span>MA</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartEMA-${symbol}" checked><span>EMA</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartVWAP-${symbol}"><span>VWAP</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showChartSR-${symbol}"><span>S/R</span></label>
+                            <label class="mini-toggle"><input type="checkbox" id="showFVG-${symbol}" checked><span>FVG</span></label>
+                        </div>
+                    </div>
+                    <div class="card-settings-row">
+                        <label>Volume Style</label>
+                        <select id="volumeType-${symbol}" class="input-sm">
+                            <option value="buysell">Buy/Sell</option>
+                            <option value="regular">Regular</option>
+                        </select>
+                    </div>
+                    <div class="card-settings-row">
+                        <label>MA Periods</label>
+                        <input type="text" id="maLines-${symbol}" value="20" class="input-sm">
+                    </div>
+                    <div class="card-settings-row">
+                        <label>EMA Periods</label>
+                        <input type="text" id="emaLines-${symbol}" value="21" class="input-sm">
+                    </div>
+                </div>
+                <div class="card-settings-section">
+                    <span class="settings-section-label">🕯️ Candle Patterns</span>
+                    <div class="patterns-grid">
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-Doji" checked><span>Doji</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-Hammer" checked><span>Hammer</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-InvHammer" checked><span>Inv Ham</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-HangingMan" checked><span>Hang Man</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-ShootStar" checked><span>Shoot Star</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-Marubozu" checked><span>Marubozu</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-SpinTop" checked><span>Spin Top</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-BullEngulf" checked><span>Bull Eng</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-BearEngulf" checked><span>Bear Eng</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-BullHarami" checked><span>Bull Har</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-BearHarami" checked><span>Bear Har</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-Piercing" checked><span>Piercing</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-DarkCloud" checked><span>Dark Cloud</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-TweezTop" checked><span>Tweez Top</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-TweezBot" checked><span>Tweez Bot</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-MorningStar" checked><span>Morning ⭐</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-EveningStar" checked><span>Evening ⭐</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-3Soldiers" checked><span>3 Soldiers</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="pattern-${symbol}-3Crows" checked><span>3 Crows</span></label>
+                    </div>
+                </div>
+                <div class="card-settings-section">
+                    <span class="settings-section-label">👁️ Display Options</span>
+                    <div class="display-toggles">
+                        <label class="mini-toggle"><input type="checkbox" id="showPriceInfo-${symbol}" checked><span>Price Info</span></label>
+                        <label class="mini-toggle"><input type="checkbox" id="showTimers-${symbol}" checked><span>Timers</span></label>
+                        <label class="mini-toggle"><input type="checkbox" id="showConfluenceBar-${symbol}" checked><span>Confluence Bar</span></label>
+                    </div>
+                </div>
+                <div class="card-settings-section">
+                    <span class="settings-section-label">🏷️ Badge Alerts</span>
+                    <div class="patterns-grid">
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-LowVol" checked><span>LowVol</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-HighVol" checked><span>HighVol</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-VolSpike" checked><span>VolSpike</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-MACDUp" checked><span>MACD↑</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-MACDDown" checked><span>MACD↓</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-MACDCrossUp" checked><span>MACDx↑</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-MACDCrossDown" checked><span>MACDx↓</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-RejHi" checked><span>RejHi</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-RejLo" checked><span>RejLo</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-OB" checked><span>OB</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-OS" checked><span>OS</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-ExtOB" checked><span>ExtOB</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-ExtOS" checked><span>ExtOS</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-Indecision" checked><span>Indeci</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-BigBody" checked><span>BigBody</span></label>
+                        <label class="pattern-toggle"><input type="checkbox" id="badge-${symbol}-Engulf" checked><span>Engulf</span></label>
+                    </div>
+                </div>
+            </div>
+            <div class="chart-options">
+                <span class="chart-help">Scroll/Pinch to zoom • Drag to pan</span>
+            </div>
+            <!-- Charts -->
+            <div class="tf-block-charts" id="blockCharts-${symbol}">
+                <div style="text-align:center;padding:1rem;color:var(--text-muted);font-size:0.75rem;">Loading...</div>
+            </div>
+        `;
+        container.appendChild(block);
+        
+        // Add TF toggle click handlers for this coin
+        block.querySelectorAll('.tf-toggle-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const tfId = btn.dataset.tf;
+                const coinSymbol = btn.dataset.symbol;
+                toggleAddedCoinTf(coinSymbol, tfId);
+            });
+        });
+        
+        // Add settings button handler
+        const settingsBtn = block.querySelector('.btn-card-settings');
+        settingsBtn?.addEventListener('click', () => {
+            const settings = document.getElementById(`blockSettings-${symbol}`);
+            if (settings) {
+                settings.style.display = settings.style.display === 'none' ? 'block' : 'none';
+            }
+        });
+        
+        // Wire up chart indicator toggles (share global settings, redraw all)
+        ['showChartVolume', 'showChartRSI', 'showRSIDivergence', 'showChartMACD', 'showChartMA', 'showChartEMA', 'showChartVWAP', 'showChartSR', 'showFVG', 'showPriceInfo', 'showTimers', 'showConfluenceBar'].forEach(id => {
+            const el = document.getElementById(`${id}-${symbol}`);
+            if (el) {
+                el.checked = state.settings[id] !== false && state.settings[id] !== undefined ? state.settings[id] : el.checked;
+                el.addEventListener('change', (e) => {
+                    state.settings[id] = e.target.checked;
+                    const mainEl = document.getElementById(id);
+                    if (mainEl) mainEl.checked = e.target.checked;
+                    saveSettings();
+                    renderTimeframeRows();
+                });
+            }
+        });
+        
+        // Add coin swap fancy dropdown handler
+        const swapDD = document.getElementById(`coinSwapDD-${symbol}`);
+        if (swapDD) {
+            // Populate with disabled coins (main + other added)
+            const disabledSwap = [state.currentCoin?.symbol, ...state.addedCoins.filter(s => s !== symbol)].filter(Boolean);
+            populateCoinDropdownList(swapDD.querySelector('.coin-dropdown-list'), symbol, disabledSwap, true);
+            
+            setupCoinDropdown(swapDD, (newSymbol) => {
+                if (newSymbol && newSymbol !== symbol) {
+                    swapAddedCoin(symbol, newSymbol);
+                }
+            });
+        }
+        
+        // Initialize data storage for this coin
+        if (!state.addedCoinData) state.addedCoinData = {};
+        state.addedCoinData[symbol] = {
+            price: null,
+            change: null,
+            data: {},
+            candles: {}
+        };
+        
+        // Fetch price and render timeframes
+        fetchAddedCoinFullData(symbol, coin);
+    });
+    
+    // Sync main coin dropdown (disable already-added coins)
+    populateMainCoinSwap();
+    
+    // Render confluence cards in shared area
+    renderAddedConfluenceCards();
+}
+
+// Render added coin confluence cards next to main confluence
+function renderAddedConfluenceCards() {
+    const container = document.getElementById('addedConfluences');
+    if (!container) return;
+    
+    if (!state.addedCoins || state.addedCoins.length === 0) {
+        container.innerHTML = '';
+        return;
+    }
+    
+    container.innerHTML = state.addedCoins.map(symbol => {
+        const coin = state.coins.find(c => c.symbol === symbol);
+        const base = symbol.replace('USDT', '');
+        const iconUrl = coin?.icon || '';
+        const iconHtml = iconUrl ? `<img class="conf-coin-icon" src="${iconUrl}" width="20" height="20" alt="">` : '';
+        
+        // Per-coin settings
+        const cs = (state.addedCoinSettings && state.addedCoinSettings[symbol]) || { weightMethod: 'linear', useStrengthMod: true, useVolumeMod: true, useIndicatorMod: true };
+        const method = cs.weightMethod || 'linear';
+        const methodLabel = method.charAt(0).toUpperCase() + method.slice(1);
+        const methodData = WEIGHT_METHODS[method];
+        let formula = methodData?.description || '';
+        const mods = [];
+        if (cs.useStrengthMod) mods.push('Body(×0.6-1.3)');
+        if (cs.useVolumeMod) mods.push('Vol(×0.7-1.4)');
+        if (cs.useIndicatorMod) mods.push('RSI+MACD momentum');
+        formula += '\nTrend: EMA21/50 alignment + candle + close position';
+        if (mods.length > 0) formula += `\nModifiers: ${mods.join(', ')}`;
+        
+        return `
+        <section class="card confluence-card confluence-card-added" data-symbol="${symbol}">
+            <div class="card-header">
+                <h2>${iconHtml} 📊 <span>${base}</span></h2>
+                <button class="btn btn-sm btn-card-settings conf-settings-btn-added" data-symbol="${symbol}" title="Confluence Settings">⚙️</button>
+            </div>
+            <div class="card-settings conf-settings-added" id="confSettings-${symbol}" style="display: none;">
+                <div class="card-settings-row">
+                    <label>TF Weight Method</label>
+                    <div class="fancy-select">
+                        <select class="added-weight-method" data-symbol="${symbol}">
+                            <option value="equal"${method==='equal'?' selected':''}>Equal</option>
+                            <option value="linear"${method==='linear'?' selected':''}>Linear</option>
+                            <option value="exponential"${method==='exponential'?' selected':''}>Exponential</option>
+                            <option value="tiered"${method==='tiered'?' selected':''}>Tiered</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="card-settings-row">
+                    <label>Modifiers</label>
+                    <div class="modifier-toggles">
+                        <label class="mini-toggle"><input type="checkbox" class="added-mod" data-symbol="${symbol}" data-mod="useStrengthMod" ${cs.useStrengthMod?'checked':''}><span>Body Strength</span></label>
+                        <label class="mini-toggle"><input type="checkbox" class="added-mod" data-symbol="${symbol}" data-mod="useVolumeMod" ${cs.useVolumeMod?'checked':''}><span>Volume</span></label>
+                        <label class="mini-toggle"><input type="checkbox" class="added-mod" data-symbol="${symbol}" data-mod="useIndicatorMod" ${cs.useIndicatorMod?'checked':''}><span>RSI/MACD</span></label>
+                    </div>
+                </div>
+            </div>
+            <div class="confluence-content">
+                <div class="confluence-meter">
+                    <div class="meter-bar"><div class="meter-fill" id="confFill-${symbol}"></div></div>
+                    <div class="meter-labels"><span>🔴</span><span>🟡</span><span>🟢</span></div>
+                </div>
+                <div class="confluence-stats">
+                    <div class="stat"><span class="stat-value" id="confScore-${symbol}">50%</span><span class="stat-label">Score</span></div>
+                    <div class="stat"><span class="stat-value text-bull" id="confBull-${symbol}">0</span><span class="stat-label">Bull</span></div>
+                    <div class="stat"><span class="stat-value text-bear" id="confBear-${symbol}">0</span><span class="stat-label">Bear</span></div>
+                    <div class="stat"><span class="stat-value" id="confBias-${symbol}">—</span><span class="stat-label">Bias</span></div>
+                    <div class="stat"><span class="stat-value signal-value" id="confSignal-${symbol}">—</span><span class="stat-label">Signal</span></div>
+                </div>
+                <div class="confluence-method">
+                    <div class="method-title">Method: <span>${methodLabel}</span></div>
+                    <div class="method-formula">${formula}</div>
+                    <div class="method-weights" id="confMethodWeights-${symbol}"></div>
+                    <div class="methods-comparison">
+                        <div class="methods-compare-header" data-target="confCompareBody-${symbol}">
+                            <span>📐 Compare All Methods</span>
+                            <span class="methods-compare-icon">▼</span>
+                        </div>
+                        <div class="methods-compare-body" id="confCompareBody-${symbol}" style="display:none;"></div>
+                    </div>
+                </div>
+                <div class="confluence-history">
+                    <div class="history-header" data-target="confHistoryList-${symbol}">
+                        <span>📜 Recent High Confluence</span>
+                        <span class="history-toggle-icon">▼</span>
+                    </div>
+                    <div class="history-list" id="confHistoryList-${symbol}">
+                        <div class="history-empty">No high confluence moments recorded yet</div>
+                    </div>
+                </div>
+            </div>
+        </section>`;
+    }).join('');
+    
+    // Wire up toggle listeners for added coin cards
+    container.querySelectorAll('.conf-settings-btn-added').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const panel = document.getElementById(`confSettings-${btn.dataset.symbol}`);
+            if (panel) panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        });
+    });
+    container.querySelectorAll('.added-weight-method').forEach(sel => {
+        sel.addEventListener('change', (e) => {
+            const sym = e.target.dataset.symbol;
+            if (!state.addedCoinSettings) state.addedCoinSettings = {};
+            if (!state.addedCoinSettings[sym]) state.addedCoinSettings[sym] = {};
+            state.addedCoinSettings[sym].weightMethod = e.target.value;
+            saveSettings();
+            calculateAddedCoinConfluence(sym);
+            renderAddedConfluenceCards();
+        });
+    });
+    container.querySelectorAll('.added-mod').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            const sym = e.target.dataset.symbol;
+            if (!state.addedCoinSettings) state.addedCoinSettings = {};
+            if (!state.addedCoinSettings[sym]) state.addedCoinSettings[sym] = {};
+            state.addedCoinSettings[sym][e.target.dataset.mod] = e.target.checked;
+            saveSettings();
+            calculateAddedCoinConfluence(sym);
+            renderAddedConfluenceCards();
+        });
+    });
+    container.querySelectorAll('.methods-compare-header[data-target]').forEach(header => {
+        header.addEventListener('click', () => {
+            const body = document.getElementById(header.dataset.target);
+            if (body) body.style.display = body.style.display === 'none' ? 'block' : 'none';
+            header.querySelector('.methods-compare-icon').textContent = body?.style.display === 'none' ? '▼' : '▲';
+        });
+    });
+    container.querySelectorAll('.history-header[data-target]').forEach(header => {
+        header.addEventListener('click', () => {
+            const list = document.getElementById(header.dataset.target);
+            if (list) list.style.display = list.style.display === 'none' ? 'block' : 'none';
+            header.querySelector('.history-toggle-icon').textContent = list?.style.display === 'none' ? '▼' : '▲';
+        });
+    });
+}
+
+// ============================================
+// PER-COIN CONFLUENCE CALCULATION (Added Coins)
+// ============================================
+function calculateAddedCoinConfluence(symbol) {
+    const coinTfState = state.addedCoinTfState?.[symbol];
+    if (!coinTfState) return;
+    
+    // Per-coin confluence settings
+    const cs = (state.addedCoinSettings && state.addedCoinSettings[symbol]) || { weightMethod: 'linear', useStrengthMod: true, useVolumeMod: true, useIndicatorMod: true };
+    
+    const enabledTFs = coinTfState.filter(tf => tf.enabled);
+    const weights = WEIGHT_METHODS[cs.weightMethod] || WEIGHT_METHODS.linear;
+    
+    let totalBullWeight = 0, totalBearWeight = 0;
+    let bullCount = 0, bearCount = 0, alignedTFs = 0;
+    const tfDetails = [];
+    
+    enabledTFs.forEach(tf => {
+        const data = state.data[`${symbol}-${tf.id}`];
+        if (!data) return;
+        
+        const baseWeight = weights[tf.id] || 1;
+        let finalWeight = baseWeight;
+        
+        let directionScore = 0;
+        directionScore += data.isBullish ? 0.25 : -0.25;
+        directionScore += (data.closePos - 0.5) * 0.5;
+        if (data.trend) {
+            directionScore += data.trend.priceAboveEma21 ? 0.25 : -0.25;
+            directionScore += data.trend.ema21AboveEma50 ? 0.25 : -0.25;
+        }
+        directionScore = Math.max(-1, Math.min(1, directionScore));
+        
+        let momentumScore = 0;
+        if (cs.useIndicatorMod && data.rsi && data.macd) {
+            if (data.rsi > 60) momentumScore += 0.5;
+            else if (data.rsi < 40) momentumScore -= 0.5;
+            else momentumScore += (data.rsi - 50) / 20;
+            if (data.trend?.rsiRising) momentumScore += 0.15; else momentumScore -= 0.15;
+            if (data.macd.histogram > 0) momentumScore += 0.25; else momentumScore -= 0.25;
+            if (data.macd.crossedUp) momentumScore += 0.3;
+            else if (data.macd.crossedDown) momentumScore -= 0.3;
+            momentumScore = Math.max(-1, Math.min(1, momentumScore));
+        }
+        
+        const hasInd = cs.useIndicatorMod && data.rsi && data.macd;
+        const tfScore = hasInd ? (directionScore * 0.6 + momentumScore * 0.4) : directionScore;
+        
+        const modifiers = [];
+        if (cs.useStrengthMod) {
+            if (data.bodyPct >= 70) { finalWeight *= 1.3; modifiers.push('STR↑'); }
+            else if (data.bodyPct < 40) { finalWeight *= 0.6; modifiers.push('STR↓'); }
+        }
+        if (cs.useVolumeMod) {
+            if (data.volumeRatio >= 2.5) { finalWeight *= 1.4; modifiers.push('VOL↑↑'); }
+            else if (data.volumeRatio >= 1.5) { finalWeight *= 1.2; modifiers.push('VOL↑'); }
+            else if (data.volumeRatio <= 0.6) { finalWeight *= 0.7; modifiers.push('VOL↓'); }
+        }
+        
+        const isBullTF = tfScore > 0;
+        const ws = Math.abs(tfScore) * finalWeight;
+        if (isBullTF) { totalBullWeight += ws; bullCount++; }
+        else { totalBearWeight += ws; bearCount++; }
+        if (Math.abs(tfScore) > 0.3) alignedTFs++;
+        
+        tfDetails.push({ tf: tf.label, base: baseWeight, final: finalWeight.toFixed(2), mods: modifiers.join(' '), dir: isBullTF ? '🟢' : '🔴', score: tfScore.toFixed(2) });
+    });
+    
+    const total = totalBullWeight + totalBearWeight;
+    const pct = total > 0 ? (totalBullWeight / total) * 100 : 50;
+    
+    // Store for chart markers
+    if (!state.addedCoinConfluence) state.addedCoinConfluence = {};
+    state.addedCoinConfluence[symbol] = pct;
+    
+    // Update UI
+    updateAddedCoinConfluenceDisplay(symbol, pct, bullCount, bearCount, tfDetails);
+}
+
+function updateAddedCoinConfluenceDisplay(symbol, pct, bullCount, bearCount, tfDetails) {
+    const fill = document.getElementById(`confFill-${symbol}`);
+    const scoreEl = document.getElementById(`confScore-${symbol}`);
+    const bullEl = document.getElementById(`confBull-${symbol}`);
+    const bearEl = document.getElementById(`confBear-${symbol}`);
+    const biasEl = document.getElementById(`confBias-${symbol}`);
+    const signalEl = document.getElementById(`confSignal-${symbol}`);
+    const methodWeights = document.getElementById(`confMethodWeights-${symbol}`);
+    
+    if (fill) fill.style.left = `${pct}%`;
+    
+    if (scoreEl) {
+        scoreEl.textContent = `${pct.toFixed(1)}%`;
+        scoreEl.className = `stat-value ${pct >= 60 ? 'text-bull' : pct <= 40 ? 'text-bear' : 'text-neutral'}`;
+    }
+    
+    if (bullEl) bullEl.textContent = bullCount;
+    if (bearEl) bearEl.textContent = bearCount;
+    
+    if (biasEl) {
+        let bias = '🟡 MIXED', cls = 'text-neutral';
+        if (pct >= 70) { bias = '🟢 BULL'; cls = 'text-bull'; }
+        else if (pct <= 30) { bias = '🔴 BEAR'; cls = 'text-bear'; }
+        biasEl.textContent = bias;
+        biasEl.className = `stat-value ${cls}`;
+    }
+    
+    if (signalEl) {
+        let sig = '—', cls = '';
+        if (pct >= 75) { sig = 'STRONG BUY'; cls = 'text-bull'; }
+        else if (pct >= 60) { sig = 'BUY'; cls = 'text-bull'; }
+        else if (pct <= 25) { sig = 'STRONG SELL'; cls = 'text-bear'; }
+        else if (pct <= 40) { sig = 'SELL'; cls = 'text-bear'; }
+        else { sig = 'NEUTRAL'; cls = 'text-neutral'; }
+        signalEl.textContent = sig;
+        signalEl.className = `stat-value signal-value ${cls}`;
+    }
+    
+    // Method weights — same format as main
+    if (methodWeights && tfDetails.length > 0) {
+        methodWeights.innerHTML = tfDetails.map(w => 
+            `<div>${w.dir} ${w.tf}: ${w.base}→${w.final} [${w.score}] ${w.mods ? `(${w.mods})` : ''}</div>`
+        ).join('');
+    }
+    
+    // Track history for added coin
+    trackAddedCoinHistory(symbol, pct);
+}
+
+function trackAddedCoinHistory(symbol, pct) {
+    if (pct < 70 && pct > 30) return;
+    
+    const now = new Date();
+    const key = `mtfcm_confHistory_${symbol}`;
+    
+    if (!state.addedCoinHistory) state.addedCoinHistory = {};
+    if (!state.addedCoinHistory[symbol]) {
+        try { state.addedCoinHistory[symbol] = JSON.parse(localStorage.getItem(key) || '[]'); } catch(e) { state.addedCoinHistory[symbol] = []; }
+    }
+    
+    const hist = state.addedCoinHistory[symbol];
+    const last = hist[0];
+    if (last && (now - new Date(last.time)) < 60000) return;
+    
+    const bias = pct >= 70 ? 'BULL' : 'BEAR';
+    hist.unshift({ time: now.toISOString(), score: pct.toFixed(1), bias });
+    if (hist.length > 10) hist.length = 10;
+    
+    try { localStorage.setItem(key, JSON.stringify(hist)); } catch(e) {}
+    
+    // Update history list in UI
+    const listEl = document.getElementById(`confHistoryList-${symbol}`);
+    if (listEl) {
+        if (hist.length === 0) {
+            listEl.innerHTML = '<div class="history-empty">No high confluence moments recorded yet</div>';
+        } else {
+            listEl.innerHTML = hist.map(r => {
+                const d = new Date(r.time);
+                const timeStr = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+                const dateStr = d.toLocaleDateString([], {month:'short', day:'numeric'});
+                return `<div class="history-item"><span class="history-time">${dateStr} ${timeStr}</span><span class="history-score ${r.bias === 'BULL' ? 'text-bull' : 'text-bear'}">${r.score}% ${r.bias === 'BULL' ? '🟢' : '🔴'}</span></div>`;
+            }).join('');
+        }
+    }
+}
+
+// Toggle TF for added coin (independent from main)
+function toggleAddedCoinTf(symbol, tfId) {
+    if (!state.addedCoinTfState || !state.addedCoinTfState[symbol]) return;
+    
+    const tf = state.addedCoinTfState[symbol].find(t => t.id === tfId);
+    if (tf) {
+        tf.enabled = !tf.enabled;
+        
+        // Update UI
+        const btn = document.querySelector(`.tf-toggle-btn[data-tf="${tfId}"][data-symbol="${symbol}"]`);
+        if (btn) {
+            btn.classList.toggle('active', tf.enabled);
+        }
+        
+        // Re-render this coin's charts
+        const coin = state.coins.find(c => c.symbol === symbol);
+        if (coin) {
+            fetchAddedCoinFullData(symbol, coin);
+        }
+    }
+}
+
+async function fetchAddedCoinFullData(symbol, coin) {
+    try {
+        // Fetch current price
+        const priceRes = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
+        const priceData = await priceRes.json();
+        
+        const price = parseFloat(priceData.lastPrice);
+        const change = parseFloat(priceData.priceChangePercent);
+        
+        // Update price display in block header
+        const priceEl = document.getElementById(`blockPrice-${symbol}`);
+        if (priceEl) {
+            priceEl.innerHTML = `
+                <span class="price-value">$${price.toFixed(coin.decimals)}</span>
+                <span class="price-change ${change >= 0 ? 'bull' : 'bear'}">${change >= 0 ? '+' : ''}${change.toFixed(2)}%</span>
+            `;
+        }
+        
+        // Store data
+        if (state.addedCoinData[symbol]) {
+            state.addedCoinData[symbol].price = price;
+            state.addedCoinData[symbol].change = change;
+        }
+        
+        const chartsContainer = document.getElementById(`blockCharts-${symbol}`);
+        if (!chartsContainer) return;
+        
+        // Use this coin's TF state (independent from main)
+        const coinTfState = state.addedCoinTfState?.[symbol] || [];
+        const enabledTFs = coinTfState.filter(tf => tf.enabled);
+        
+        if (enabledTFs.length === 0) {
+            chartsContainer.innerHTML = '<div style="text-align:center;padding:1rem;color:var(--text-muted);font-size:0.75rem;">Select timeframes above</div>';
+            return;
+        }
+        
+        // Remove rows for TFs that are no longer enabled
+        const enabledIds = new Set(enabledTFs.map(tf => tf.id));
+        chartsContainer.querySelectorAll('.tf-row').forEach(row => {
+            if (!enabledIds.has(row.dataset.tf)) row.remove();
+        });
+        // Remove placeholder text if present
+        const placeholder = chartsContainer.querySelector('div[style*="text-align"]');
+        if (placeholder && !placeholder.classList.contains('tf-row')) placeholder.remove();
+        
+        // Fetch all enabled TFs in parallel for faster loading
+        const tfPromises = enabledTFs.map(tf => {
+            const mainTf = state.timeframes.find(t => t.id === tf.id);
+            return mainTf ? fetchAddedCoinTimeframe(symbol, coin, mainTf) : null;
+        }).filter(Boolean);
+        
+        await Promise.allSettled(tfPromises);
+        
+        // Calculate confluence for this added coin
+        calculateAddedCoinConfluence(symbol);
+        
+    } catch (err) {
+        console.error(`Error fetching data for ${symbol}:`, err);
+    }
+}
+
+async function fetchAddedCoinTimeframe(symbol, coin, tf) {
+    try {
+        const response = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${tf.id}&limit=${CANDLE_LIMIT}`);
+        const klines = await response.json();
+        
+        const candles = klines.map(k => ({
+            openTime: k[0],
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
+            closeTime: k[6]
+        }));
+        
+        // Store candles
+        if (state.addedCoinData[symbol]) {
+            state.addedCoinData[symbol].candles[tf.id] = candles;
+        }
+        
+        // Render timeframe row
+        renderAddedCoinTimeframeRow(symbol, coin, tf, candles);
+        
+    } catch (err) {
+        console.error(`Error fetching ${tf.id} for ${symbol}:`, err);
+    }
+}
+
+function renderAddedCoinTimeframeRow(symbol, coin, tf, candles) {
+    const chartsContainer = document.getElementById(`blockCharts-${symbol}`);
+    if (!chartsContainer) return;
+    
+    // Remove loading text if present
+    const loadingEl = chartsContainer.querySelector('div[style*="Loading"]');
+    if (loadingEl) loadingEl.remove();
+    
+    // Use analyzeCandles to build same data format as main coin
+    const chartTfId = `${symbol}-${tf.id}`;
+    const analyzedData = analyzeCandles(candles, chartTfId);
+    if (!analyzedData) return;
+    
+    // Store in state.data so drawInteractiveChart can use it
+    state.data[chartTfId] = analyzedData;
+    state.patterns[chartTfId] = detectAllPatterns(candles);
+    
+    // Store candles for interaction
+    if (!state.addedCoinCandles) state.addedCoinCandles = {};
+    state.addedCoinCandles[`${symbol}-${tf.id}`] = { candles, coin };
+    
+    // Build row using shared function — same look as main coin
+    const rowHtml = buildTfRowHtml(tf.label, tf.id, analyzedData, {
+        decimals: coin.decimals || 2,
+        symbol: symbol,
+        currentPrice: analyzedData.current?.close || 0
+    });
+    
+    // Check if row already exists
+    let row = chartsContainer.querySelector(`[data-tf="${tf.id}"]`);
+    if (!row) {
+        row = document.createElement('div');
+        row.dataset.tf = tf.id;
+        chartsContainer.appendChild(row);
+    }
+    
+    // Parse the HTML from buildTfRowHtml — it returns a wrapper div, extract inner content
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = rowHtml.trim();
+    const builtRow = tempDiv.firstElementChild;
+    
+    // Transfer attributes and content
+    row.className = builtRow.className;
+    row.innerHTML = builtRow.innerHTML;
+    
+    // Draw chart using the SAME function as main coin (with retry for layout timing)
+    const canvasId = `chart-${symbol}-${tf.id}`;
+    const chartOpts = { decimals: coin.decimals || 2 };
+    const drawChart = (attempt = 0) => {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+        
+        const rect = canvas.getBoundingClientRect();
+        if ((rect.width < 10) && attempt < 10) {
+            requestAnimationFrame(() => setTimeout(() => drawChart(attempt + 1), 50 * (attempt + 1)));
+            return;
+        }
+        
+        drawInteractiveChart(canvasId, analyzedData, chartTfId, chartOpts);
+        setupChartInteraction(canvasId, chartTfId, { data: analyzedData, decimals: coin.decimals || 2 });
+    };
+    requestAnimationFrame(() => setTimeout(drawChart, 50));
+}
+
+
+function drawMiniCoinChart(canvas, klines) {
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    
+    const candles = klines.map(k => ({
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4])
+    }));
+    
+    const prices = candles.flatMap(c => [c.high, c.low]);
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const priceRange = maxPrice - minPrice || 1;
+    
+    const padding = 2;
+    const chartWidth = width - padding * 2;
+    const chartHeight = height - padding * 2;
+    
+    const scaleY = (price) => padding + chartHeight - ((price - minPrice) / priceRange) * chartHeight;
+    
+    const candleSpacing = chartWidth / candles.length;
+    const candleWidth = Math.max(1, candleSpacing * 0.6);
+    
+    // Theme
+    const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const isDark = theme === 'dark';
+    const isColorful = theme === 'colorful';
+    const bgColor = isDark ? '#161630' : (isColorful ? '#ede9fe' : '#fafbfc');
+    const bullColor = isDark ? '#34d399' : '#059669';
+    const bearColor = isDark ? '#fb7185' : '#e11d48';
+    
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, width, height);
+    
+    candles.forEach((candle, i) => {
+        const x = padding + i * candleSpacing + candleSpacing / 2;
+        const isBull = candle.close >= candle.open;
+        const openY = scaleY(candle.open);
+        const closeY = scaleY(candle.close);
+        const highY = scaleY(candle.high);
+        const lowY = scaleY(candle.low);
+        
+        ctx.strokeStyle = isBull ? bullColor : bearColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, highY);
+        ctx.lineTo(x, lowY);
+        ctx.stroke();
+        
+        ctx.fillStyle = isBull ? bullColor : bearColor;
+        const bodyTop = Math.min(openY, closeY);
+        const bodyHeight = Math.max(1, Math.abs(closeY - openY));
+        ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+    });
+}
+
+

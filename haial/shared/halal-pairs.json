@@ -1,0 +1,534 @@
+{
+  "_generated": "2026-02-28",
+  "_source": "Haial Platform v9.5 \u2014 Extended Coin Database (IFG+PIF+Amanah+Sharlife+CryptoUmmah)",
+  "_note": "MTFCM reads this file to filter trading pairs. Only halal/caution coins get trading signals.",
+  "pairs": [
+    {
+      "ticker": "BTC",
+      "name": "Bitcoin",
+      "verdict": "halal",
+      "pair": "BTCUSDT",
+      "source": "IFG+PIF+Amanah"
+    },
+    {
+      "ticker": "ETH",
+      "name": "Ethereum",
+      "verdict": "halal",
+      "pair": "ETHUSDT",
+      "source": "IFG+PIF"
+    },
+    {
+      "ticker": "ADA",
+      "name": "Cardano",
+      "verdict": "halal",
+      "pair": "ADAUSDT",
+      "source": "IFG+PIF+Amanah"
+    },
+    {
+      "ticker": "SOL",
+      "name": "Solana",
+      "verdict": "halal",
+      "pair": "SOLUSDT",
+      "source": "IFG+PIF"
+    },
+    {
+      "ticker": "XRP",
+      "name": "Ripple",
+      "verdict": "halal",
+      "pair": "XRPUSDT",
+      "source": "PIF+Amanah"
+    },
+    {
+      "ticker": "DOT",
+      "name": "Polkadot",
+      "verdict": "halal",
+      "pair": "DOTUSDT",
+      "source": "IFG+PIF"
+    },
+    {
+      "ticker": "AVAX",
+      "name": "Avalanche",
+      "verdict": "halal",
+      "pair": "AVAXUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "MATIC",
+      "name": "Polygon",
+      "verdict": "halal",
+      "pair": "MATICUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "LINK",
+      "name": "Chainlink",
+      "verdict": "halal",
+      "pair": "LINKUSDT",
+      "source": "IFG+PIF"
+    },
+    {
+      "ticker": "ATOM",
+      "name": "Cosmos",
+      "verdict": "halal",
+      "pair": "ATOMUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "LTC",
+      "name": "Litecoin",
+      "verdict": "halal",
+      "pair": "LTCUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "TON",
+      "name": "Toncoin",
+      "verdict": "halal",
+      "pair": "TONUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "XLM",
+      "name": "Stellar",
+      "verdict": "halal",
+      "pair": "XLMUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "ALGO",
+      "name": "Algorand",
+      "verdict": "halal",
+      "pair": "ALGOUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "VET",
+      "name": "VeChain",
+      "verdict": "halal",
+      "pair": "VETUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "FIL",
+      "name": "Filecoin",
+      "verdict": "halal",
+      "pair": "FILUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "HBAR",
+      "name": "Hedera",
+      "verdict": "halal",
+      "pair": "HBARUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "NEAR",
+      "name": "Near Protocol",
+      "verdict": "halal",
+      "pair": "NEARUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "SUI",
+      "name": "Sui",
+      "verdict": "halal",
+      "pair": "SUIUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "APT",
+      "name": "Aptos",
+      "verdict": "halal",
+      "pair": "APTUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "RENDER",
+      "name": "Render",
+      "verdict": "halal",
+      "pair": "RENDERUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "FET",
+      "name": "Fetch.ai",
+      "verdict": "halal",
+      "pair": "FETUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "AR",
+      "name": "Arweave",
+      "verdict": "halal",
+      "pair": "ARUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "XTZ",
+      "name": "Tezos",
+      "verdict": "halal",
+      "pair": "XTZUSDT",
+      "source": "IFG+PIF"
+    },
+    {
+      "ticker": "ARB",
+      "name": "Arbitrum",
+      "verdict": "halal",
+      "pair": "ARBUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "OP",
+      "name": "Optimism",
+      "verdict": "halal",
+      "pair": "OPUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "ICP",
+      "name": "Internet Computer",
+      "verdict": "caution",
+      "pair": "ICPUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "BNB",
+      "name": "BNB",
+      "verdict": "caution",
+      "pair": "BNBUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "UNI",
+      "name": "Uniswap",
+      "verdict": "caution",
+      "pair": "UNIUSDT",
+      "source": "IFG"
+    },
+    {
+      "ticker": "INJ",
+      "name": "Injective",
+      "verdict": "caution",
+      "pair": "INJUSDT",
+      "source": "PIF"
+    },
+    {
+      "ticker": "TIA",
+      "name": "Celestia",
+      "verdict": "halal",
+      "pair": "TIAUSDT",
+      "source": "PIF",
+      "note": "Data availability infrastructure \u2014 no haram elements"
+    },
+    {
+      "ticker": "STRK",
+      "name": "Starknet",
+      "verdict": "halal",
+      "pair": "STRKUSDT",
+      "source": "PIF",
+      "note": "Ethereum L2 scaling \u2014 similar analysis to DOT"
+    },
+    {
+      "ticker": "MANTA",
+      "name": "Manta Network",
+      "verdict": "halal",
+      "pair": "MANTAUSDT",
+      "source": "PIF",
+      "note": "Privacy-focused L2 \u2014 blockchain infrastructure"
+    },
+    {
+      "ticker": "ROSE",
+      "name": "Oasis Network",
+      "verdict": "halal",
+      "pair": "ROSEUSDT",
+      "source": "PIF",
+      "note": "Privacy-preserving blockchain \u2014 data tokenization"
+    },
+    {
+      "ticker": "SKL",
+      "name": "SKALE",
+      "verdict": "halal",
+      "pair": "SKLUSDT",
+      "source": "PIF",
+      "note": "Ethereum L2 scaling network"
+    },
+    {
+      "ticker": "SAGA",
+      "name": "Saga",
+      "verdict": "halal",
+      "pair": "SAGAUSDT",
+      "source": "PIF",
+      "note": "Blockchain infrastructure for launching chains"
+    },
+    {
+      "ticker": "CTSI",
+      "name": "Cartesi",
+      "verdict": "halal",
+      "pair": "CTSIUSDT",
+      "source": "PIF",
+      "note": "Computation layer \u2014 Linux-based blockchain OS"
+    },
+    {
+      "ticker": "AXL",
+      "name": "Axelar",
+      "verdict": "halal",
+      "pair": "AXLUSDT",
+      "source": "PIF",
+      "note": "Cross-chain interoperability infrastructure"
+    },
+    {
+      "ticker": "KAIA",
+      "name": "Kaia",
+      "verdict": "halal",
+      "pair": "KAIAUSDT",
+      "source": "PIF",
+      "note": "L1 blockchain (Klaytn+Finschia merger)"
+    },
+    {
+      "ticker": "PYTH",
+      "name": "Pyth Network",
+      "verdict": "halal",
+      "pair": "PYTHUSDT",
+      "source": "PIF",
+      "note": "Oracle network \u2014 similar analysis to LINK"
+    },
+    {
+      "ticker": "DASH",
+      "name": "Dash",
+      "verdict": "halal",
+      "pair": "DASHUSDT",
+      "source": "IFG",
+      "note": "Digital payment cryptocurrency \u2014 similar to BTC/LTC"
+    },
+    {
+      "ticker": "BAT",
+      "name": "Basic Attention Token",
+      "verdict": "halal",
+      "pair": "BATUSDT",
+      "source": "IFG",
+      "note": "Browser advertising utility \u2014 no haram elements"
+    },
+    {
+      "ticker": "DCR",
+      "name": "Decred",
+      "verdict": "halal",
+      "pair": "DCRUSDT",
+      "source": "PIF",
+      "note": "Governance/payment crypto \u2014 similar to BTC"
+    },
+    {
+      "ticker": "COTI",
+      "name": "COTI",
+      "verdict": "halal",
+      "pair": "COTIUSDT",
+      "source": "PIF",
+      "note": "Payment infrastructure layer"
+    },
+    {
+      "ticker": "FLOW",
+      "name": "Flow",
+      "verdict": "halal",
+      "pair": "FLOWUSDT",
+      "source": "PIF",
+      "note": "NFT/gaming blockchain by Dapper Labs"
+    },
+    {
+      "ticker": "UTK",
+      "name": "xMoney",
+      "verdict": "halal",
+      "pair": "UTKUSDT",
+      "source": "PIF",
+      "note": "Crypto payment gateway \u2014 utility token"
+    },
+    {
+      "ticker": "ENS",
+      "name": "Ethereum Name Service",
+      "verdict": "halal",
+      "pair": "ENSUSDT",
+      "source": "PIF",
+      "note": "Domain naming infrastructure \u2014 pure utility"
+    },
+    {
+      "ticker": "TWT",
+      "name": "Trust Wallet Token",
+      "verdict": "halal",
+      "pair": "TWTUSDT",
+      "source": "PIF",
+      "note": "Wallet utility/governance token"
+    },
+    {
+      "ticker": "SFP",
+      "name": "SafePal",
+      "verdict": "halal",
+      "pair": "SFPUSDT",
+      "source": "PIF",
+      "note": "Hardware wallet utility token"
+    },
+    {
+      "ticker": "HOOK",
+      "name": "Hooked Protocol",
+      "verdict": "halal",
+      "pair": "HOOKUSDT",
+      "source": "PIF",
+      "note": "Learn-to-earn education platform"
+    },
+    {
+      "ticker": "SAND",
+      "name": "The Sandbox",
+      "verdict": "caution",
+      "pair": "SANDUSDT",
+      "source": "IFG+Sharlife",
+      "note": "Metaverse/gaming \u2014 halal platform but user content may include haram elements"
+    },
+    {
+      "ticker": "GALA",
+      "name": "Gala Games",
+      "verdict": "caution",
+      "pair": "GALAUSDT",
+      "source": "PIF",
+      "note": "Gaming platform \u2014 some games may involve gambling mechanics"
+    },
+    {
+      "ticker": "ILV",
+      "name": "Illuvium",
+      "verdict": "caution",
+      "pair": "ILVUSDT",
+      "source": "PIF",
+      "note": "Gaming/metaverse RPG \u2014 gameplay involves battling/rewards"
+    },
+    {
+      "ticker": "PYR",
+      "name": "Vulcan Forged",
+      "verdict": "caution",
+      "pair": "PYRUSDT",
+      "source": "PIF",
+      "note": "Gaming ecosystem \u2014 multiple games, some may have maysir elements"
+    },
+    {
+      "ticker": "PIXEL",
+      "name": "Pixels",
+      "verdict": "caution",
+      "pair": "PIXELUSDT",
+      "source": "PIF",
+      "note": "Gaming token \u2014 relatively new, limited screening"
+    },
+    {
+      "ticker": "SUPER",
+      "name": "SuperVerse",
+      "verdict": "caution",
+      "pair": "SUPERUSDT",
+      "source": "PIF",
+      "note": "Gaming/metaverse \u2014 limited scholarly screening available"
+    },
+    {
+      "ticker": "XAI",
+      "name": "Xai",
+      "verdict": "caution",
+      "pair": "XAIUSDT",
+      "source": "PIF",
+      "note": "Gaming L3 on Arbitrum \u2014 new project, limited screening"
+    },
+    {
+      "ticker": "CHZ",
+      "name": "Chiliz",
+      "verdict": "caution",
+      "pair": "CHZUSDT",
+      "source": "PIF",
+      "note": "Sports fan tokens \u2014 borderline maysir concerns on sports speculation"
+    },
+    {
+      "ticker": "ZEC",
+      "name": "Zcash",
+      "verdict": "caution",
+      "pair": "ZECUSDT",
+      "source": "IFG",
+      "note": "Privacy coin \u2014 technically permissible but criminal usage concern (taqwa)"
+    },
+    {
+      "ticker": "XVG",
+      "name": "Verge",
+      "verdict": "caution",
+      "pair": "XVGUSDT",
+      "source": "PIF",
+      "note": "Privacy coin \u2014 similar taqwa concerns as Monero/Zcash"
+    },
+    {
+      "ticker": "ZEN",
+      "name": "Horizen",
+      "verdict": "caution",
+      "pair": "ZENUSDT",
+      "source": "PIF",
+      "note": "Privacy/sidechain platform \u2014 privacy focus raises taqwa questions"
+    },
+    {
+      "ticker": "RSR",
+      "name": "Reserve Rights",
+      "verdict": "caution",
+      "pair": "RSRUSDT",
+      "source": "PIF",
+      "note": "Stablecoin protocol \u2014 complex tokenomics, some DeFi integration"
+    },
+    {
+      "ticker": "GTC",
+      "name": "Gitcoin",
+      "verdict": "caution",
+      "pair": "GTCUSDT",
+      "source": "PIF",
+      "note": "Governance for open-source funding \u2014 quadratic funding mechanism"
+    }
+  ],
+  "blocked": [
+    {
+      "ticker": "AAVE",
+      "reason": "Lending protocol \u2014 straightforwardly riba (IFG)"
+    },
+    {
+      "ticker": "MKR",
+      "reason": "MakerDAO lending governance \u2014 facilitates riba"
+    },
+    {
+      "ticker": "COMP",
+      "reason": "Compound lending protocol \u2014 riba"
+    },
+    {
+      "ticker": "PEPE",
+      "reason": "Meme coin \u2014 pure maysir + gharar"
+    },
+    {
+      "ticker": "FLOKI",
+      "reason": "Meme coin \u2014 speculation"
+    },
+    {
+      "ticker": "BONK",
+      "reason": "Meme coin \u2014 speculation"
+    },
+    {
+      "ticker": "FUN",
+      "reason": "Gambling token \u2014 haram industry"
+    },
+    {
+      "ticker": "RLB",
+      "reason": "Casino platform \u2014 maysir"
+    },
+    {
+      "ticker": "XVS",
+      "reason": "Lending protocol \u2014 riba"
+    },
+    {
+      "ticker": "NMR",
+      "name": "Numeraire",
+      "reason": "Prediction market staking \u2014 users stake NMR on data science predictions, borders maysir"
+    },
+    {
+      "ticker": "REZ",
+      "name": "Renzo",
+      "reason": "Liquid restaking protocol \u2014 staking derivatives, riba/gharar concerns"
+    },
+    {
+      "ticker": "HFT",
+      "name": "Hashflow",
+      "reason": "DeFi trading protocol \u2014 facilitates leveraged/derivative trading"
+    }
+  ]
+}
